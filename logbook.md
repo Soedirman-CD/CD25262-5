@@ -1,4 +1,4 @@
-## Logbook Kelompok X
+## Logbook Kelompok 5
 
 Mata kuliah: Capstone Design
 
@@ -83,8 +83,28 @@ Anggota
 
 #### Catatan
 
+-
+
+
+###  Rabu 20 Mei 2026
+
+#### Yang sudah dilakukan
+
+- Mengkalibrasi sensor pH untuk menentukan set point
+- Mengkalibrasi sensor dissolved oxygen (DO) untuk memastikan set point
+- Mendesain box untuk jadi panel box projek
+
+#### Masalah yang dihadapi
+
+- kondisi kualitas pH air yang kurang maksimal karena buffer pH kurang terlarut pada nilai tertentu
+- kondisi suhu air dan keadaan alami dari malam hari sehingga kadar DO yang turun sangat drastis 
+
+#### Yang akan dilakukan
+
+- [ ]  Melakukan pengecekan ulang terhadap sensor di lingkungan yang tepat untuk memastikan set point, PIC @argailyas
+- [ ]  Melanjutkan desain dari panel box untuk di pesan nantinya, @farhanibnufajar
+- [ ]  Mencicil DCP-400, @daconk
+
+#### Catatan
+
 - 
-
-
-
-
