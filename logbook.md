@@ -108,3 +108,20 @@ Anggota
 #### Catatan
 
 - 
+
+###  Senin 25 Mei 2026
+
+#### Yang sudah dilakukan
+
+-Mengkalibrasi lagi sensor DO yang turun drastis ke 0v, alhamdulillah kembali sehat sensor DO-nya
+#### Masalah yang dihadapi
+
+- terkadang setelah di tetapkan kondisi optimal pada DO, malah anomali lagi
+
+#### Yang akan dilakukan
+
+- bersihin lebih bersih bagian kerak di probenya
+
+#### Catatan
+
+- sering-sering aja buat ngalibrasi sensor DO, bagian pucuknya agak berkerak cuy, terus umurnya sudah tua ini sensor
