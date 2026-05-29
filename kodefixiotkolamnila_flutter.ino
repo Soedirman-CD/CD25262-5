@@ -13,7 +13,7 @@
 // =====================================================
 // WIFI
 // =====================================================
-const char* ssid     = "WATON1";
+const char* ssid     = "WATON";
 const char* password = "yalalwaton";
 
 // =====================================================
@@ -202,6 +202,8 @@ void setup_wifi() {
   delay(2000);
   lcd.clear();
 }
+
+
 
 // =====================================================
 // PUBLISH RELAY STATUS
@@ -777,31 +779,51 @@ void loop() {
 
     lastLCDUpdate = millis();
 
-    lcd.clear();
-
     // =================================================
     // BARIS 1
     // =================================================
     lcd.setCursor(0, 0);
-    lcd.print("Suhu:");
-    lcd.print(suhu, 1);
-    lcd.print("C pH:");
-    lcd.print(ph, 1);
+
+    char line1[21];
+    snprintf(
+      line1,
+      sizeof(line1),
+      "Suhu:%.1fC pH:%.1f ",
+      suhu,
+      ph
+    );
+
+    lcd.print(line1);
 
     // =================================================
     // BARIS 2
     // =================================================
     lcd.setCursor(0, 1);
-    lcd.print("DO:");
-    lcd.print(doValue, 2);
-    lcd.print("mg/L");
+
+    char line2[21];
+    snprintf(
+      line2,
+      sizeof(line2),
+      "DO:%.2f mg/L      ",
+      doValue
+    );
+
+    lcd.print(line2);
 
     // =================================================
     // BARIS 3
     // =================================================
     lcd.setCursor(0, 2);
-    lcd.print("Mode:");
-    lcd.print(autoMode ? "AUTO" : "MANUAL");
+
+    char line3[21];
+    snprintf(
+      line3,
+      sizeof(line3),
+      "Mode:%s           ",
+      autoMode ? "AUTO" : "MANUAL"
+    );
+
+    lcd.print(line3);
 
     // =================================================
     // COUNTDOWN
@@ -834,35 +856,35 @@ void loop() {
     // =================================================
     lcd.setCursor(0, 3);
 
+    char line4[21];
+
     if (dosingState != IDLE) {
 
-      lcd.print("Sts:");
-      lcd.print(textStatus);
-      lcd.print(" ");
-
-      // AERATION FORMAT menit.detik
       if (dosingState == AERATION) {
 
         unsigned long minutePart = remainingTime / 60;
         unsigned long secondPart = remainingTime % 60;
 
-        lcd.print(minutePart);
-        lcd.print(".");
-
-        if (secondPart < 10) {
-          lcd.print("0");
-        }
-
-        lcd.print(secondPart);
-        lcd.print("s");
+        snprintf(
+          line4,
+          sizeof(line4),
+          "Sts:%s %02lu.%02lus ",
+          textStatus.c_str(),
+          minutePart,
+          secondPart
+        );
 
       }
 
-      // MIXING & DOSING
       else {
 
-        lcd.print(remainingTime);
-        lcd.print("s");
+        snprintf(
+          line4,
+          sizeof(line4),
+          "Sts:%s %02lus      ",
+          textStatus.c_str(),
+          remainingTime
+        );
 
       }
 
@@ -870,9 +892,15 @@ void loop() {
 
     else {
 
-      lcd.print("Sts:");
-      lcd.print(textStatus);
+      snprintf(
+        line4,
+        sizeof(line4),
+        "Sts:%s            ",
+        textStatus.c_str()
+      );
 
     }
+
+    lcd.print(line4);
   }
 }
