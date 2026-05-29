@@ -67,6 +67,14 @@ float CALIBRATION_VOLTAGE = 1294.2;
 float CALIBRATION_DO      = 8.1366;
 
 // =====================================================
+// DO HYSTERESIS
+// =====================================================
+const float DO_LOW  = 4.0;
+const float DO_HIGH = 4.5;
+
+bool lowDOActive = false;
+
+// =====================================================
 // DS18B20
 // =====================================================
 OneWire oneWire(SUHU_PIN);
@@ -89,6 +97,16 @@ const char* LWT_PAYLOAD = "{\"connected\":false}";
 // TIMER
 // =====================================================
 unsigned long lastPublish = 0;
+unsigned long lastLCDUpdate = 0;
+
+// =====================================================
+// GLOBAL SENSOR DATA
+// =====================================================
+float suhu    = 0;
+float ph      = 0;
+float doValue = 0;
+
+String textStatus = "READY";
 
 // =====================================================
 // SYSTEM MODE
@@ -436,12 +454,23 @@ void reconnect() {
 void autoControl(float ph, float doValue) {
 
   // =================================================
-  // PRIORITAS DO
-  // Jika DO rendah:
-  // - hentikan seluruh proses injeksi pH
-  // - nyalakan aerator backup
+  // HYSTERESIS DO
   // =================================================
-  if (doValue < 4.0) {
+
+  // LOW DO aktif
+  if (doValue < DO_LOW) {
+    lowDOActive = true;
+  }
+
+  // LOW DO selesai hanya jika sudah > DO_HIGH
+  if (doValue > DO_HIGH) {
+    lowDOActive = false;
+  }
+
+  // =================================================
+  // PRIORITAS DO
+  // =================================================
+  if (lowDOActive) {
 
     // Reset dosing process
     dosingState = IDLE;
@@ -452,20 +481,44 @@ void autoControl(float ph, float doValue) {
     dosingStartTime = 0;
     aerationStartTime = 0;
 
-    // Matikan mixing & dosing
-    pengadukDolomitState = false;
-    pompaDolomitState    = false;
+    // Matikan mixing
+    if (pengadukDolomitState) {
 
-    digitalWrite(RELAY_PENGADUK_DOLOMIT, HIGH);
-    digitalWrite(RELAY_POMPA_DOLOMIT, HIGH);
+      pengadukDolomitState = false;
 
-    publishRelayStatus("kolam1/status/pengaduk_dolomit", false);
-    publishRelayStatus("kolam1/status/pompa_dolomit", false);
+      digitalWrite(RELAY_PENGADUK_DOLOMIT, HIGH);
+
+      publishRelayStatus(
+        "kolam1/status/pengaduk_dolomit",
+        false
+      );
+    }
+
+    // Matikan dosing
+    if (pompaDolomitState) {
+
+      pompaDolomitState = false;
+
+      digitalWrite(RELAY_POMPA_DOLOMIT, HIGH);
+
+      publishRelayStatus(
+        "kolam1/status/pompa_dolomit",
+        false
+      );
+    }
 
     // Nyalakan aerator backup
-    aeratorBackupState = true;
-    digitalWrite(RELAY_AERATOR_BACKUP, LOW);
-    publishRelayStatus("kolam1/status/aerator_backup", true);
+    if (!aeratorBackupState) {
+
+      aeratorBackupState = true;
+
+      digitalWrite(RELAY_AERATOR_BACKUP, LOW);
+
+      publishRelayStatus(
+        "kolam1/status/aerator_backup",
+        true
+      );
+    }
 
     Serial.println("LOW DO PRIORITY ACTIVE");
 
@@ -476,10 +529,16 @@ void autoControl(float ph, float doValue) {
   // DO NORMAL
   // Matikan aerator backup jika tidak sedang aerasi
   // =================================================
-  if (dosingState == IDLE) {
+  if (dosingState == IDLE && aeratorBackupState) {
+
     aeratorBackupState = false;
+
     digitalWrite(RELAY_AERATOR_BACKUP, HIGH);
-    publishRelayStatus("kolam1/status/aerator_backup", false);
+
+    publishRelayStatus(
+      "kolam1/status/aerator_backup",
+      false
+    );
   }
 
   if (ph < 7.0 && !dosingProcessActive && dosingState == IDLE) {
@@ -638,9 +697,9 @@ void loop() {
   if (millis() - lastPublish > 5000) {
     lastPublish = millis();
 
-    float suhu    = readTemperature();
-    float ph      = readPH();
-    float doValue = readDO(suhu);
+    suhu    = readTemperature();
+    ph      = readPH();
+    doValue = readDO(suhu);
 
     // =================================================
     // SENSOR VALIDATION
@@ -665,7 +724,7 @@ void loop() {
     // =================================================
     // LOGIKA NOTIFIKASI STATUS
     // =================================================
-    String textStatus = "READY";
+    textStatus = "READY";
 
     if (safeMode) {
       publishSystemStatus("SAFE_MODE");
@@ -708,31 +767,44 @@ void loop() {
     Serial.print("DO     : "); Serial.println(doValue);
     Serial.println("==============");
 
-    // =================================================
-    // UPDATE TAMPILAN LCD 20x4
-    // =================================================
+    
+  }
+
+  // =================================================
+  // UPDATE LCD REALTIME (1 DETIK)
+  // =================================================
+  if (millis() - lastLCDUpdate > 1000) {
+
+    lastLCDUpdate = millis();
+
     lcd.clear();
 
-    // Baris 1: Suhu & pH
+    // =================================================
+    // BARIS 1
+    // =================================================
     lcd.setCursor(0, 0);
-    lcd.print("Suhu: ");
+    lcd.print("Suhu:");
     lcd.print(suhu, 1);
-    lcd.print("C pH: ");
+    lcd.print("C pH:");
     lcd.print(ph, 1);
 
-    // Baris 2: DO
+    // =================================================
+    // BARIS 2
+    // =================================================
     lcd.setCursor(0, 1);
-    lcd.print("DO: ");
+    lcd.print("DO:");
     lcd.print(doValue, 2);
-    lcd.print(" mg/L");
+    lcd.print("mg/L");
 
-    // Baris 3: Mode sistem
+    // =================================================
+    // BARIS 3
+    // =================================================
     lcd.setCursor(0, 2);
-    lcd.print("Mode Sistem: ");
+    lcd.print("Mode:");
     lcd.print(autoMode ? "AUTO" : "MANUAL");
 
     // =================================================
-    // COUNTDOWN AKTUATOR
+    // COUNTDOWN
     // =================================================
     unsigned long remainingTime = 0;
 
@@ -757,19 +829,9 @@ void loop() {
 
     }
 
-    // Hindari nilai minus
-    if ((long)remainingTime < 0) {
-      remainingTime = 0;
-    }
-
     // =================================================
-    // LCD BARIS 4
+    // BARIS 4
     // =================================================
-    lcd.setCursor(0, 3);
-
-    // Bersihkan baris
-    lcd.print("                    ");
-
     lcd.setCursor(0, 3);
 
     if (dosingState != IDLE) {
@@ -778,9 +840,7 @@ void loop() {
       lcd.print(textStatus);
       lcd.print(" ");
 
-      // =================================================
-      // KHUSUS AERATION → tampil menit
-      // =================================================
+      // AERATION FORMAT menit.detik
       if (dosingState == AERATION) {
 
         unsigned long minutePart = remainingTime / 60;
@@ -789,7 +849,6 @@ void loop() {
         lcd.print(minutePart);
         lcd.print(".");
 
-        // Tambahkan leading zero
         if (secondPart < 10) {
           lcd.print("0");
         }
@@ -799,9 +858,7 @@ void loop() {
 
       }
 
-      // =================================================
-      // MIXING & DOSING → tetap detik
-      // =================================================
+      // MIXING & DOSING
       else {
 
         lcd.print(remainingTime);
@@ -809,7 +866,9 @@ void loop() {
 
       }
 
-    } else {
+    }
+
+    else {
 
       lcd.print("Sts:");
       lcd.print(textStatus);
