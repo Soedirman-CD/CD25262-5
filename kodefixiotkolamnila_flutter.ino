@@ -138,7 +138,6 @@ enum DosingState {
   DOSING,
   AERATION
 };
-
 DosingState dosingState = IDLE;
 
 // =====================================================
@@ -151,9 +150,9 @@ unsigned long aerationStartTime = 0;
 // =====================================================
 // DOSING DURATION
 // =====================================================
-const unsigned long MIXING_DURATION   = 60000;
-const unsigned long DOSING_DURATION   = 20000;
-const unsigned long AERATION_DURATION = 900000;
+const unsigned long MIXING_DURATION   = 60000;   // 1 menit countdown mixing di bak dolomit
+const unsigned long DOSING_DURATION   = 15000;   // 15 detik countdown injeksi dolomit
+const unsigned long AERATION_DURATION = 900000;  // 15 menit countdown mixing/aerasi di kolam
 
 // =====================================================
 // DOSING LOCK
@@ -161,75 +160,60 @@ const unsigned long AERATION_DURATION = 900000;
 bool dosingProcessActive = false;
 
 // =====================================================
+// GLOBAL COUNTDOWN VARIABLE
+// =====================================================
+long countdownSeconds = 0;
+const char* currentDosingStateStr = "IDLE";
+
+// =====================================================
 // WIFI CONNECT
 // =====================================================
 void setup_wifi() {
-
   delay(10);
-
   Serial.println();
   Serial.print("Connecting WiFi: ");
   Serial.println(ssid);
 
   lcd.clear();
-
   lcd.setCursor(0, 0);
   lcd.print(" CONNECTING WIFI ");
-
   lcd.setCursor(0, 1);
   lcd.print(ssid);
 
   WiFi.mode(WIFI_STA);
-
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
-
   WiFi.begin(ssid, password);
 
   int retry = 0;
-
   while (WiFi.status() != WL_CONNECTED && retry < 30) {
-
     delay(500);
-
     Serial.print(".");
-
     lcd.setCursor(retry % 20, 2);
     lcd.print(".");
-
     retry++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-
     Serial.println();
     Serial.println("WiFi Connected");
     Serial.println(WiFi.localIP());
 
     lcd.clear();
-
     lcd.setCursor(0, 0);
     lcd.print(" WIFI CONNECTED ");
-
     lcd.setCursor(0, 1);
     lcd.print(WiFi.localIP());
-
     delay(2000);
-
     lcd.clear();
-
   } else {
-
     Serial.println();
     Serial.println("WiFi Failed!");
 
     lcd.clear();
-
     lcd.setCursor(0, 0);
     lcd.print(" WIFI FAILED ");
-
     delay(2000);
-
     lcd.clear();
   }
 }
@@ -238,47 +222,28 @@ void setup_wifi() {
 // WIFI RECONNECT CHECK
 // =====================================================
 void checkWiFiConnection() {
-
   static unsigned long lastReconnectAttempt = 0;
-
   if (WiFi.status() != WL_CONNECTED) {
-
-    // reconnect tiap 5 detik
     if (millis() - lastReconnectAttempt > 5000) {
-
       lastReconnectAttempt = millis();
-
       Serial.println("WiFi disconnected!");
       Serial.println("Trying reconnect WiFi...");
-
       WiFi.disconnect();
       WiFi.begin(ssid, password);
     }
 
-    // =================================================
-    // LCD BLINK MODE
-    // =================================================
     if (!showReconnectMessage) {
-
       if (millis() - lcdBlinkTimer >= SENSOR_DISPLAY_TIME) {
-
         lcdBlinkTimer = millis();
-
         showReconnectMessage = true;
       }
-
     } else {
-
       if (millis() - lcdBlinkTimer >= RECONNECT_DISPLAY_TIME) {
-
         lcdBlinkTimer = millis();
-
         showReconnectMessage = false;
       }
     }
-
   } else {
-
     showReconnectMessage = false;
   }
 }
@@ -287,17 +252,11 @@ void checkWiFiConnection() {
 // PUBLISH RELAY STATUS
 // =====================================================
 void publishRelayStatus(const char* topic, bool state) {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["state"] = state;
-
   char buffer[200];
-
   serializeJson(doc, buffer);
-
   client.publish(topic, buffer, true);
 }
 
@@ -305,17 +264,11 @@ void publishRelayStatus(const char* topic, bool state) {
 // PUBLISH MODE STATUS
 // =====================================================
 void publishModeStatus() {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["mode"] = autoMode ? "AUTO" : "MANUAL";
-
   char buffer[200];
-
   serializeJson(doc, buffer);
-
   client.publish("kolam1/status/mode", buffer, true);
 }
 
@@ -323,17 +276,11 @@ void publishModeStatus() {
 // PUBLISH SAFE MODE STATUS
 // =====================================================
 void publishSafeModeStatus() {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["safe_mode"] = safeMode;
-
   char buffer[200];
-
   serializeJson(doc, buffer);
-
   client.publish("kolam1/status/safe_mode", buffer, true);
 }
 
@@ -341,23 +288,15 @@ void publishSafeModeStatus() {
 // WIFI STATUS
 // =====================================================
 void publishWifiStatus(bool connected) {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["connected"] = connected;
-
   if (connected) {
-
     doc["ssid"] = ssid;
     doc["ip"]   = WiFi.localIP().toString();
   }
-
   char buffer[200];
-
   serializeJson(doc, buffer);
-
   client.publish(LWT_TOPIC, buffer, true);
 }
 
@@ -365,17 +304,11 @@ void publishWifiStatus(bool connected) {
 // PUBLISH SYSTEM STATUS
 // =====================================================
 void publishSystemStatus(String status) {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["status"] = status;
-
   char buffer[200];
-
   serializeJson(doc, buffer);
-
   client.publish("kolam1/status/system", buffer, true);
 }
 
@@ -383,34 +316,42 @@ void publishSystemStatus(String status) {
 // PUBLISH SENSOR
 // =====================================================
 void publishSensor(const char* topic, float value, const char* unit) {
-
   if (!client.connected()) return;
-
   StaticJsonDocument<200> doc;
-
   doc["value"] = value;
   doc["unit"]  = unit;
+  char buffer[200];
+  serializeJson(doc, buffer);
+  client.publish(topic, buffer, true);
+}
+
+// =====================================================
+// PUBLISH COUNTDOWN TO DASHBOARD
+// =====================================================
+void publishCountdown(long remainingSeconds, const char* stateStr) {
+  if (!client.connected()) return;
+  StaticJsonDocument<200> doc;
+  doc["remaining_seconds"] = remainingSeconds;
+  doc["state"] = stateStr;
+
+  char formatBuf[10];
+  snprintf(formatBuf, sizeof(formatBuf), "%02ld:%02ld", remainingSeconds / 60, remainingSeconds % 60);
+  doc["formatted"] = formatBuf;
 
   char buffer[200];
-
   serializeJson(doc, buffer);
-
-  client.publish(topic, buffer, true);
+  client.publish("kolam1/status/countdown", buffer, true);
 }
 
 // =====================================================
 // SAFE MODE
 // =====================================================
 void activateSafeMode() {
-
   safeMode = true;
-
   Serial.println("SAFE MODE ACTIVE");
-
   aeratorBackupState = true;
 
   digitalWrite(RELAY_AERATOR_BACKUP, LOW);
-
   publishRelayStatus("kolam1/status/aerator_backup", true);
 
   pengadukDolomitState = false;
@@ -428,58 +369,37 @@ void activateSafeMode() {
 // MQTT CALLBACK
 // =====================================================
 void callback(char* topic, byte* payload, unsigned int length) {
-
   String message;
-
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
 
   StaticJsonDocument<200> doc;
-
   DeserializationError error = deserializeJson(doc, message);
-
   if (error) return;
 
   if (String(topic) == "kolam1/system/mode") {
-
     String mode = doc["mode"];
-
     autoMode = (mode == "AUTO");
-
     publishModeStatus();
-
     return;
   }
 
   if (!autoMode && !safeMode) {
-
     bool state = doc["state"];
-
     if (String(topic) == "kolam1/control/aerator_backup") {
-
       aeratorBackupState = state;
-
       digitalWrite(RELAY_AERATOR_BACKUP, state ? LOW : HIGH);
-
       publishRelayStatus("kolam1/status/aerator_backup", state);
     }
-
     if (String(topic) == "kolam1/control/pengaduk_dolomit") {
-
       pengadukDolomitState = state;
-
       digitalWrite(RELAY_PENGADUK_DOLOMIT, state ? LOW : HIGH);
-
       publishRelayStatus("kolam1/status/pengaduk_dolomit", state);
     }
-
     if (String(topic) == "kolam1/control/pompa_dolomit") {
-
       pompaDolomitState = state;
-
       digitalWrite(RELAY_POMPA_DOLOMIT, state ? LOW : HIGH);
-
       publishRelayStatus("kolam1/status/pompa_dolomit", state);
     }
   }
@@ -489,12 +409,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // MQTT RECONNECT
 // =====================================================
 void reconnect() {
-
   while (!client.connected() && WiFi.status() == WL_CONNECTED) {
-
     String clientId = "ESP32_KOLAM_";
     clientId += String(random(0xffff), HEX);
-
     Serial.print("Connecting MQTT...");
 
     if (client.connect(
@@ -506,114 +423,84 @@ void reconnect() {
           true,
           LWT_PAYLOAD
         )) {
-
       Serial.println(" connected!");
-
       client.subscribe("kolam1/control/#");
       client.subscribe("kolam1/system/#");
 
       publishModeStatus();
       publishSafeModeStatus();
       publishWifiStatus(true);
-
     } else {
-
       Serial.print(" failed rc=");
       Serial.println(client.state());
-
       delay(5000);
     }
   }
 }
 
 // =====================================================
-// AUTO CONTROL
+// AUTO CONTROL (FIXED & REAL-TIME PRECISE)
 // =====================================================
 void autoControl(float ph, float doValue) {
-
-  if (doValue < 4.0) {
-
-    aeratorBackupState = true;
-
-    digitalWrite(RELAY_AERATOR_BACKUP, LOW);
-
-    publishRelayStatus("kolam1/status/aerator_backup", true);
-
-    return;
-  }
-
+  // 1. STATE MACHINE DOSING PH
   if (ph < 7.0 && !dosingProcessActive && dosingState == IDLE) {
-
     dosingProcessActive = true;
-
     dosingState = MIXING;
-
     mixingStartTime = millis();
 
     pengadukDolomitState = true;
-
     digitalWrite(RELAY_PENGADUK_DOLOMIT, LOW);
-
     publishRelayStatus("kolam1/status/pengaduk_dolomit", true);
   }
 
   if (dosingState == MIXING) {
-
     if (millis() - mixingStartTime >= MIXING_DURATION) {
-
       pengadukDolomitState = false;
-
       digitalWrite(RELAY_PENGADUK_DOLOMIT, HIGH);
-
       publishRelayStatus("kolam1/status/pengaduk_dolomit", false);
 
       pompaDolomitState = true;
-
       digitalWrite(RELAY_POMPA_DOLOMIT, LOW);
-
       publishRelayStatus("kolam1/status/pompa_dolomit", true);
 
       dosingState = DOSING;
-
       dosingStartTime = millis();
     }
   }
 
   if (dosingState == DOSING) {
-
     if (millis() - dosingStartTime >= DOSING_DURATION) {
-
       pompaDolomitState = false;
-
       digitalWrite(RELAY_POMPA_DOLOMIT, HIGH);
-
       publishRelayStatus("kolam1/status/pompa_dolomit", false);
 
-      aeratorBackupState = true;
-
-      digitalWrite(RELAY_AERATOR_BACKUP, LOW);
-
-      publishRelayStatus("kolam1/status/aerator_backup", true);
-
       dosingState = AERATION;
-
       aerationStartTime = millis();
     }
   }
 
   if (dosingState == AERATION) {
-
     if (millis() - aerationStartTime >= AERATION_DURATION) {
-
-      aeratorBackupState = false;
-
-      digitalWrite(RELAY_AERATOR_BACKUP, HIGH);
-
-      publishRelayStatus("kolam1/status/aerator_backup", false);
-
       dosingState = IDLE;
-
       dosingProcessActive = false;
+    }
+  }
+
+  // 2. KONTROL AERATOR BACKUP TERPUSAT
+  bool needAeratorForDO = (doValue < 4.0);
+  bool needAeratorForDosing = (dosingState == AERATION);
+
+  if (needAeratorForDO || needAeratorForDosing) {
+    if (!aeratorBackupState) {
+      aeratorBackupState = true;
+      digitalWrite(RELAY_AERATOR_BACKUP, LOW);
+      publishRelayStatus("kolam1/status/aerator_backup", true);
+    }
+  } else {
+    if (aeratorBackupState) {
+      aeratorBackupState = false;
+      digitalWrite(RELAY_AERATOR_BACKUP, HIGH);
+      publishRelayStatus("kolam1/status/aerator_backup", false);
     }
   }
 }
@@ -622,24 +509,15 @@ void autoControl(float ph, float doValue) {
 // READ PH
 // =====================================================
 float readPH() {
-
   const int samples = 10;
-
   float total = 0;
-
   for (int i = 0; i < samples; i++) {
-
     int adcValue = analogRead(PH_PIN);
-
     float voltage = adcValue * (3.3 / 4095.0);
-
     float phValue = calibration_value - (voltage * 5.70);
-
     total += phValue;
-
     delay(20);
   }
-
   return total / samples;
 }
 
@@ -647,13 +525,9 @@ float readPH() {
 // READ DO
 // =====================================================
 float readDO(float tempC) {
-
   int rawADC = analogRead(DO_PIN);
-
   float voltage = rawADC * (VREF / ADC_RES);
-
   float doValue = (voltage / CALIBRATION_VOLTAGE) * CALIBRATION_DO;
-
   return doValue;
 }
 
@@ -661,22 +535,14 @@ float readDO(float tempC) {
 // READ TEMPERATURE
 // =====================================================
 float readTemperature() {
-
   const int samples = 3;
-
   float total = 0;
-
   for (int i = 0; i < samples; i++) {
-
     sensors.requestTemperatures();
-
     float temp = sensors.getTempCByIndex(0);
-
     total += temp;
-
     delay(100);
   }
-
   return total / samples;
 }
 
@@ -684,16 +550,12 @@ float readTemperature() {
 // SETUP
 // =====================================================
 void setup() {
-
   Serial.begin(115200);
-
   analogReadResolution(12);
-
   sensors.begin();
-
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  lcd.begin();
+  lcd.begin(20, 4);
   lcd.backlight();
 
   pinMode(RELAY_AERATOR_UTAMA, OUTPUT);
@@ -711,11 +573,8 @@ void setup() {
   digitalWrite(RELAY_SOLENOID_OUT, HIGH);
 
   setup_wifi();
-
   espClient.setInsecure();
-
   client.setServer(mqtt_server, mqtt_port);
-
   client.setCallback(callback);
 }
 
@@ -723,25 +582,25 @@ void setup() {
 // LOOP
 // =====================================================
 void loop() {
-
   checkWiFiConnection();
 
   if (WiFi.status() == WL_CONNECTED) {
-
     if (!client.connected()) {
       reconnect();
     }
-
     client.loop();
+  }
+
+  // JALANKAN AUTOMODE SETIAP SIKLUS LOOP AGAR TIMER NEGOSIASI DAN TRANSISI STATE AKURAT
+  if (autoMode && !safeMode) {
+    autoControl(phGlobal, doGlobal);
   }
 
   // ===================================================
   // SENSOR UPDATE EVERY 5 SEC
   // ===================================================
   if (millis() - lastPublish > 5000) {
-
     lastPublish = millis();
-
     suhuGlobal = readTemperature();
     phGlobal   = readPH();
     doGlobal   = readDO(suhuGlobal);
@@ -753,84 +612,53 @@ void loop() {
         suhuGlobal < 0 || suhuGlobal > 50 ||
         phGlobal < 0 || phGlobal > 14 ||
         doGlobal < 0 || doGlobal > 20) {
-
       activateSafeMode();
-
     } else {
-
       safeMode = false;
-
       publishSafeModeStatus();
-    }
-
-    // =================================================
-    // AUTO MODE
-    // =================================================
-    if (autoMode && !safeMode) {
-      autoControl(phGlobal, doGlobal);
     }
 
     // =================================================
     // STATUS SYSTEM
     // =================================================
     textStatusGlobal = "NORMAL";
-
     if (safeMode) {
-
       publishSystemStatus("SAFE_MODE");
       textStatusGlobal = "SAFE MODE";
-
     }
     else if (pengadukDolomitState) {
-
       publishSystemStatus("MIXING_DOLOMIT");
       textStatusGlobal = "AGITATOR";
-
     }
     else if (pompaDolomitState) {
-
       publishSystemStatus("INJEKSI_DOLOMIT");
       textStatusGlobal = "INJEKSI";
-
     }
     else if (solenoidInState) {
-
       publishSystemStatus("SOLENOID_IN_ON");
       textStatusGlobal = "SOL IN";
-
     }
     else if (solenoidOutState) {
-
       publishSystemStatus("SOLENOID_OUT_ON");
       textStatusGlobal = "SOL OUT";
-
     }
     else if (aeratorBackupState) {
-
       publishSystemStatus("AERATOR_BACKUP_ON");
       textStatusGlobal = "AERASI BACK";
-
     }
     else if (doGlobal < 4.0) {
-
       publishSystemStatus("LOW_DO");
       textStatusGlobal = "LOW DO";
-
     }
     else if (phGlobal < 7.0) {
-
       publishSystemStatus("LOW_PH");
       textStatusGlobal = "LOW pH";
-
     }
     else if (phGlobal > 8.0) {
-
       publishSystemStatus("HIGH_PH");
       textStatusGlobal = "HIGH pH";
-
     }
     else {
-
       publishSystemStatus("NORMAL");
       textStatusGlobal = "NORMAL";
     }
@@ -844,106 +672,96 @@ void loop() {
   }
 
   // ===================================================
-  // LCD REALTIME UPDATE
-  // ===================================================
-
-  // ===================================================
-  // MODE WIFI RECONNECT MESSAGE
+  // LCD & DASHBOARD REALTIME UPDATE (EVERY 1 SEC)
   // ===================================================
   if (WiFi.status() != WL_CONNECTED && showReconnectMessage) {
-
     if (!lastReconnectScreen) {
-
       lcd.clear();
-
       lastReconnectScreen = true;
     }
-
     lcd.setCursor(0, 0);
     lcd.print(" WIFI RECONNECT ");
-
     lcd.setCursor(0, 1);
     lcd.print(" Connecting.... ");
-
     lcd.setCursor(0, 2);
     lcd.print("SSID:            ");
-
     lcd.setCursor(6, 2);
     lcd.print(ssid);
-
     lcd.setCursor(0, 3);
     lcd.print(" Please Wait... ");
-  }
-
-  // ===================================================
-  // MODE SENSOR DISPLAY
-  // ===================================================
+  } 
   else {
-
     static unsigned long lcdRefresh = 0;
-
     if (lastReconnectScreen) {
-
       lcd.clear();
-
       lastReconnectScreen = false;
     }
 
     if (millis() - lcdRefresh > 1000) {
-
       lcdRefresh = millis();
 
-      // =================================================
+      // --- HITUNG COUNTDOWN SECARA REAL-TIME ---
+      if (dosingState == MIXING) {
+        long elapsed = millis() - mixingStartTime;
+        long rem = (MIXING_DURATION - elapsed) / 1000;
+        countdownSeconds = (rem > 0) ? rem : 0;
+        currentDosingStateStr = "MIXING_BAK";
+      } else if (dosingState == DOSING) {
+        long elapsed = millis() - dosingStartTime;
+        long rem = (DOSING_DURATION - elapsed) / 1000;
+        countdownSeconds = (rem > 0) ? rem : 0;
+        currentDosingStateStr = "INJEKSI";
+      } else if (dosingState == AERATION) {
+        long elapsed = millis() - aerationStartTime;
+        long rem = (AERATION_DURATION - elapsed) / 1000;
+        countdownSeconds = (rem > 0) ? rem : 0;
+        currentDosingStateStr = "AERASI_KOLAM";
+      } else {
+        countdownSeconds = 0;
+        currentDosingStateStr = "IDLE";
+      }
+
+      // --- PUBLISH KE DASHBOARD MQTT SETIAP DETIK BERUBAH ---
+      static long lastSentCountdown = -1;
+      static const char* lastSentState = "";
+      if (countdownSeconds != lastSentCountdown || currentDosingStateStr != lastSentState) {
+        publishCountdown(countdownSeconds, currentDosingStateStr);
+        lastSentCountdown = countdownSeconds;
+        lastSentState = currentDosingStateStr;
+      }
+
       // LINE 1
-      // =================================================
       lcd.setCursor(0, 0);
-
       char line1[21];
-
-      snprintf(line1, sizeof(line1),
-               "S:%-4.1fC pH:%-4.1f",
-               suhuGlobal,
-               phGlobal);
-
+      snprintf(line1, sizeof(line1), "S:%-4.1fC pH:%-4.1f", suhuGlobal, phGlobal);
       lcd.print(line1);
 
-      // =================================================
       // LINE 2
-      // =================================================
       lcd.setCursor(0, 1);
-
       char line2[21];
-
-      snprintf(line2, sizeof(line2),
-               "DO:%-5.2f mg/L    ",
-               doGlobal);
-
+      snprintf(line2, sizeof(line2), "DO:%-5.2f mg/L    ", doGlobal);
       lcd.print(line2);
 
-      // =================================================
       // LINE 3
-      // =================================================
       lcd.setCursor(0, 2);
-
       char line3[21];
-
-      snprintf(line3, sizeof(line3),
-               "Mode:%-11s",
-               autoMode ? "AUTO" : "MANUAL");
-
+      snprintf(line3, sizeof(line3), "Mode:%-11s", autoMode ? "AUTO" : "MANUAL");
       lcd.print(line3);
 
-      // =================================================
-      // LINE 4
-      // =================================================
+      // LINE 4 (DINAMIS DENGAN HINTUNG MUNDUR)
       lcd.setCursor(0, 3);
-
       char line4[21];
-
-      snprintf(line4, sizeof(line4),
-               "Status:%-12s",
-               textStatusGlobal.c_str());
-
+      if (dosingState == MIXING) {
+        snprintf(line4, sizeof(line4), "Status:MIX BAK %02ld s", countdownSeconds);
+      } else if (dosingState == DOSING) {
+        snprintf(line4, sizeof(line4), "Status:INJEKSI %02ld s", countdownSeconds);
+      } else if (dosingState == AERATION) {
+        long mins = countdownSeconds / 60;
+        long secs = countdownSeconds % 60;
+        snprintf(line4, sizeof(line4), "Status:AERASI %02ld:%02ld", mins, secs);
+      } else {
+        snprintf(line4, sizeof(line4), "Status:%-12s", textStatusGlobal.c_str());
+      }
       lcd.print(line4);
     }
   }
