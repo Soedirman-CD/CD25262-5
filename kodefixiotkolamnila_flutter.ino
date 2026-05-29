@@ -133,7 +133,7 @@ unsigned long aerationStartTime = 0;
 // =====================================================
 const unsigned long MIXING_DURATION   =  60000;   //  1 menit
 const unsigned long DOSING_DURATION   =  20000;   // 20 detik
-const unsigned long AERATION_DURATION = 900000;   // 15 menit
+const unsigned long AERATION_DURATION =  60000;   // 15 menit
 
 // =====================================================
 // DOSING LOCK
@@ -315,8 +315,52 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (error) return;
 
   if (String(topic) == "kolam1/system/mode") {
+
     String mode = doc["mode"];
     autoMode = (mode == "AUTO");
+
+    // =================================================
+    // RESET SISTEM SAAT MASUK MODE MANUAL
+    // =================================================
+    if (!autoMode) {
+
+      // Reset state machine
+      dosingState = IDLE;
+      dosingProcessActive = false;
+
+      // Reset timer
+      mixingStartTime = 0;
+      dosingStartTime = 0;
+      aerationStartTime = 0;
+
+      // Matikan semua aktuator auto
+      aeratorBackupState   = false;
+      pengadukDolomitState = false;
+      pompaDolomitState    = false;
+      solenoidInState      = false;
+      solenoidOutState     = false;
+
+      // Relay OFF (active low)
+      digitalWrite(RELAY_AERATOR_BACKUP, HIGH);
+      digitalWrite(RELAY_PENGADUK_DOLOMIT, HIGH);
+      digitalWrite(RELAY_POMPA_DOLOMIT, HIGH);
+      digitalWrite(RELAY_SOLENOID_IN, HIGH);
+      digitalWrite(RELAY_SOLENOID_OUT, HIGH);
+
+      // Publish status relay
+      publishRelayStatus("kolam1/status/aerator_backup", false);
+      publishRelayStatus("kolam1/status/pengaduk_dolomit", false);
+      publishRelayStatus("kolam1/status/pompa_dolomit", false);
+      publishRelayStatus("kolam1/status/solenoid_in", false);
+      publishRelayStatus("kolam1/status/solenoid_out", false);
+
+      // Reset safe mode
+      safeMode = false;
+      publishSafeModeStatus();
+
+      Serial.println("SYSTEM RESET TO MANUAL MODE");
+    }
+
     publishModeStatus();
     return;
   }
@@ -391,11 +435,51 @@ void reconnect() {
 // =====================================================
 void autoControl(float ph, float doValue) {
 
+  // =================================================
+  // PRIORITAS DO
+  // Jika DO rendah:
+  // - hentikan seluruh proses injeksi pH
+  // - nyalakan aerator backup
+  // =================================================
   if (doValue < 4.0) {
+
+    // Reset dosing process
+    dosingState = IDLE;
+    dosingProcessActive = false;
+
+    // Reset timer
+    mixingStartTime = 0;
+    dosingStartTime = 0;
+    aerationStartTime = 0;
+
+    // Matikan mixing & dosing
+    pengadukDolomitState = false;
+    pompaDolomitState    = false;
+
+    digitalWrite(RELAY_PENGADUK_DOLOMIT, HIGH);
+    digitalWrite(RELAY_POMPA_DOLOMIT, HIGH);
+
+    publishRelayStatus("kolam1/status/pengaduk_dolomit", false);
+    publishRelayStatus("kolam1/status/pompa_dolomit", false);
+
+    // Nyalakan aerator backup
     aeratorBackupState = true;
     digitalWrite(RELAY_AERATOR_BACKUP, LOW);
     publishRelayStatus("kolam1/status/aerator_backup", true);
+
+    Serial.println("LOW DO PRIORITY ACTIVE");
+
     return;
+  }
+
+  // =================================================
+  // DO NORMAL
+  // Matikan aerator backup jika tidak sedang aerasi
+  // =================================================
+  if (dosingState == IDLE) {
+    aeratorBackupState = false;
+    digitalWrite(RELAY_AERATOR_BACKUP, HIGH);
+    publishRelayStatus("kolam1/status/aerator_backup", false);
   }
 
   if (ph < 7.0 && !dosingProcessActive && dosingState == IDLE) {
@@ -600,7 +684,7 @@ void loop() {
       textStatus = "SOL OUT ON";
     } else if (aeratorBackupState) {
       publishSystemStatus("AERATOR_BACKUP_ON");
-      textStatus = "AERASI BACK";
+      textStatus = "AERASI BACKUP";
     } else if (doValue < 4.0) {
       publishSystemStatus("LOW_DO");
       textStatus = "LOW DO";
@@ -649,7 +733,7 @@ void loop() {
 
     // Baris 4: Status aktuator aktif
     lcd.setCursor(0, 3);
-    lcd.print("Status: ");
+    lcd.print("Sts: ");
     lcd.print(textStatus);
   }
 }
