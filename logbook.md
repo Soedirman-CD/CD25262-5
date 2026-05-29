@@ -125,3 +125,44 @@ Anggota
 #### Catatan
 
 - sering-sering aja buat ngalibrasi sensor DO, bagian pucuknya agak berkerak cuy, terus umurnya sudah tua ini sensor
+
+###  Jumat 29 Mei 2026
+
+#### Yang sudah dilakukan
+
+- Revisi Source code sudah bisa mode auto dan manual dengan lancar
+- tampilan countdown di lcd
+
+#### Masalah yang dihadapi
+
+- ketika countdown di lcd sempat merusak alur sistem lain 
+
+#### Yang akan dilakukan
+
+- [ ]  merapikan sourcecode @farhanibnufajar
+
+#### Catatan
+
+
+###  Rabu 30 Mei 2026
+
+#### Yang sudah dilakukan
+
+- Revisi source code
+- sudah bisa menampilkan parameter yang lebih rapi
+- setiap aktuator bekerja saat mode auto, ada countdown di lcd
+- countdown di lcd per 1 detik
+- mengatur blinking lebih smooth
+- ketika wifi terputus akan tampil tulisan wifi reconnecting selama 5 detik dengan blinking tampilan data parameter 5 detik
+- ketika sistem aktif, jika wifi beljum terkoneksi, maka maksimal 10 detik untuk conecting, lebih dari itu sistem masuk ke siklus tanpa wifi dan tetap menampilkan data di lcd
+
+#### Masalah yang dihadapi
+
+- 
+#### Yang akan dilakukan
+
+- [ ]  Merapikan dashboard flutter @farhanibnufajar
+
+#### Catatan
+
+- 
