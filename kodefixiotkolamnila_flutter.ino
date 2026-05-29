@@ -13,7 +13,7 @@
 // =====================================================
 // WIFI
 // =====================================================
-const char* ssid     = "WATON";
+const char* ssid     = "WATON1";
 const char* password = "yalalwaton";
 
 // =====================================================
@@ -98,6 +98,7 @@ const char* LWT_PAYLOAD = "{\"connected\":false}";
 // =====================================================
 unsigned long lastPublish = 0;
 unsigned long lastLCDUpdate = 0;
+unsigned long lastReconnectAttempt = 0;
 
 // =====================================================
 // GLOBAL SENSOR DATA
@@ -412,40 +413,60 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // MQTT RECONNECT
 // =====================================================
 void reconnect() {
-  while (!client.connected()) {
+
+  // cek interval reconnect
+  if (millis() - lastReconnectAttempt < 5000) {
+    return;
+  }
+
+  lastReconnectAttempt = millis();
+
+  // =================================================
+  // RECONNECT WIFI
+  // =================================================
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("WiFi disconnected, reconnecting...");
+
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+
+    return;
+  }
+
+  // =================================================
+  // RECONNECT MQTT
+  // =================================================
+  if (!client.connected()) {
+
     String clientId = "ESP32_KOLAM_";
     clientId += String(random(0xffff), HEX);
 
-    Serial.print("Menghubungkan ke MQTT broker...");
+    Serial.print("Connecting MQTT...");
 
-    // connect() overload dengan LWT:
-    // connect(clientId, user, pass, willTopic, willQos, willRetain, willMsg)
     if (client.connect(
           clientId.c_str(),
           mqtt_user,
           mqtt_password,
-          LWT_TOPIC,   // will topic
-          1,           // will QoS
-          true,        // will retain
-          LWT_PAYLOAD  // will payload → {"connected":false}
+          LWT_TOPIC,
+          1,
+          true,
+          LWT_PAYLOAD
         )) {
-      Serial.println(" terhubung!");
+
+      Serial.println(" connected");
 
       client.subscribe("kolam1/control/#");
       client.subscribe("kolam1/system/#");
 
       publishModeStatus();
       publishSafeModeStatus();
-
-      // Beritahu Flutter bahwa ESP32 sudah online
-      // (WiFi + MQTT keduanya terhubung)
       publishWifiStatus(true);
 
     } else {
-      Serial.print(" gagal, rc=");
-      Serial.print(client.state());
-      Serial.println(" → coba lagi 5 detik");
-      delay(5000);
+
+      Serial.print(" failed rc=");
+      Serial.println(client.state());
     }
   }
 }
@@ -687,11 +708,15 @@ void setup() {
 // LOOP
 // =====================================================
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
+  // =================================================
+  // HANDLE WIFI + MQTT
+  // =================================================
+  reconnect();
 
-  client.loop();
+  // MQTT loop hanya jika connected
+  if (client.connected()) {
+    client.loop();
+  }
 
   // ===================================================
   // INTERVAL 5 DETIK
