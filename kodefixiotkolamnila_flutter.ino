@@ -133,7 +133,7 @@ unsigned long aerationStartTime = 0;
 // =====================================================
 const unsigned long MIXING_DURATION   =  60000;   //  1 menit
 const unsigned long DOSING_DURATION   =  20000;   // 20 detik
-const unsigned long AERATION_DURATION =  60000;   // 15 menit
+const unsigned long AERATION_DURATION = 900000;   // 15 menit
 
 // =====================================================
 // DOSING LOCK
@@ -675,7 +675,7 @@ void loop() {
       textStatus = "MIX DOLOMIT";
     } else if (pompaDolomitState) {
       publishSystemStatus("INJEKSI_PH");
-      textStatus = "INJEKSI PH";
+      textStatus = "INJEKSI pH";
     } else if (solenoidInState) {
       publishSystemStatus("SOLENOID_IN_ON");
       textStatus = "SOL IN ON";
@@ -684,7 +684,7 @@ void loop() {
       textStatus = "SOL OUT ON";
     } else if (aeratorBackupState) {
       publishSystemStatus("AERATOR_BACKUP_ON");
-      textStatus = "AERASI BACKUP";
+      textStatus = "AERASI";
     } else if (doValue < 4.0) {
       publishSystemStatus("LOW_DO");
       textStatus = "LOW DO";
@@ -731,9 +731,89 @@ void loop() {
     lcd.print("Mode Sistem: ");
     lcd.print(autoMode ? "AUTO" : "MANUAL");
 
-    // Baris 4: Status aktuator aktif
+    // =================================================
+    // COUNTDOWN AKTUATOR
+    // =================================================
+    unsigned long remainingTime = 0;
+
+    if (dosingState == MIXING) {
+
+      remainingTime =
+        (MIXING_DURATION - (millis() - mixingStartTime)) / 1000;
+
+    }
+
+    else if (dosingState == DOSING) {
+
+      remainingTime =
+        (DOSING_DURATION - (millis() - dosingStartTime)) / 1000;
+
+    }
+
+    else if (dosingState == AERATION) {
+
+      remainingTime =
+        (AERATION_DURATION - (millis() - aerationStartTime)) / 1000;
+
+    }
+
+    // Hindari nilai minus
+    if ((long)remainingTime < 0) {
+      remainingTime = 0;
+    }
+
+    // =================================================
+    // LCD BARIS 4
+    // =================================================
     lcd.setCursor(0, 3);
-    lcd.print("Sts: ");
-    lcd.print(textStatus);
+
+    // Bersihkan baris
+    lcd.print("                    ");
+
+    lcd.setCursor(0, 3);
+
+    if (dosingState != IDLE) {
+
+      lcd.print("Sts:");
+      lcd.print(textStatus);
+      lcd.print(" ");
+
+      // =================================================
+      // KHUSUS AERATION → tampil menit
+      // =================================================
+      if (dosingState == AERATION) {
+
+        unsigned long minutePart = remainingTime / 60;
+        unsigned long secondPart = remainingTime % 60;
+
+        lcd.print(minutePart);
+        lcd.print(".");
+
+        // Tambahkan leading zero
+        if (secondPart < 10) {
+          lcd.print("0");
+        }
+
+        lcd.print(secondPart);
+        lcd.print("s");
+
+      }
+
+      // =================================================
+      // MIXING & DOSING → tetap detik
+      // =================================================
+      else {
+
+        lcd.print(remainingTime);
+        lcd.print("s");
+
+      }
+
+    } else {
+
+      lcd.print("Sts:");
+      lcd.print(textStatus);
+
+    }
   }
 }
