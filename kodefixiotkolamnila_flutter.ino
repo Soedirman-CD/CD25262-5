@@ -99,6 +99,8 @@ const char* LWT_PAYLOAD = "{\"connected\":false}";
 unsigned long lastPublish = 0;
 unsigned long lastLCDUpdate = 0;
 unsigned long lastReconnectAttempt = 0;
+unsigned long wifiLCDTimer = 0;
+bool showWifiMessage = false;
 
 // =====================================================
 // GLOBAL SENSOR DATA
@@ -163,44 +165,99 @@ bool dosingProcessActive = false;
 // CONNECT WIFI WITH LCD LOADING
 // =====================================================
 void setup_wifi() {
-  delay(10);
+
   Serial.println();
   Serial.print("Connecting WiFi: ");
   Serial.println(ssid);
 
   lcd.clear();
+
   lcd.setCursor(0, 0);
-  lcd.print("  CONNECTING WIFI   ");
+  lcd.print("  CONNECTING  WIFI  ");
+
   lcd.setCursor(0, 1);
   lcd.print(ssid);
+
   lcd.setCursor(0, 2);
   lcd.print("Loading ");
 
   WiFi.begin(ssid, password);
 
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
+  unsigned long startAttemptTime = millis();
+
   int dotCount = 0;
-  while (WiFi.status() != WL_CONNECTED) {
+
+  // =================================================
+  // MAX 10 DETIK
+  // =================================================
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startAttemptTime < 10000
+  ) {
+
     delay(500);
+
     Serial.print(".");
+
     lcd.setCursor(8 + dotCount, 2);
     lcd.print(".");
+
     dotCount++;
+
     if (dotCount > 10) {
+
       lcd.setCursor(8, 2);
       lcd.print("          ");
+
       dotCount = 0;
     }
   }
 
-  Serial.println();
-  Serial.println("WiFi Connected");
-  Serial.println(WiFi.localIP());
+  // =================================================
+  // BERHASIL CONNECT
+  // =================================================
+  if (WiFi.status() == WL_CONNECTED) {
 
-  lcd.setCursor(0, 2);
-  lcd.print("   Loading Done!    ");
-  lcd.setCursor(0, 3);
-  lcd.print("    CONNECTED OK    ");
-  delay(2000);
+    Serial.println();
+    Serial.println("WiFi Connected");
+
+    lcd.setCursor(0, 2);
+    lcd.print("   CONNECTED OK!!    ");
+
+    lcd.setCursor(0, 3);
+    lcd.print(WiFi.localIP());
+
+    delay(2000);
+  }
+
+  // =================================================
+  // GAGAL CONNECT
+  // =================================================
+  else {
+
+    Serial.println();
+    Serial.println("WiFi timeout!");
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("   WIFI TIMEOUT!!   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("   SYSTEM RUNNING   ");
+
+    lcd.setCursor(0, 2);
+    lcd.print("    WITHOUT WIFI    ");
+
+    lcd.setCursor(0, 3);
+    lcd.print("    RECONNECT BG    ");
+
+    delay(3000);
+  }
+
   lcd.clear();
 }
 
@@ -803,6 +860,40 @@ void loop() {
   if (millis() - lastLCDUpdate > 1000) {
 
     lastLCDUpdate = millis();
+
+    // =================================================
+    // LCD MODE WIFI DISCONNECT
+    // =================================================
+    if (WiFi.status() != WL_CONNECTED) {
+
+      // toggle tampilan tiap 5 detik
+      if (millis() - wifiLCDTimer >= 5000) {
+        wifiLCDTimer = millis();
+        showWifiMessage = !showWifiMessage;
+      }
+
+      // =================================================
+      // TAMPILKAN PESAN WIFI
+      // =================================================
+      if (showWifiMessage) {
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print(" WIFI DISCONNECTED! ");
+
+        lcd.setCursor(0, 1);
+        lcd.print("    RECONNECTING    ");
+
+        lcd.setCursor(0, 2);
+        lcd.print("   PLEASE CONNECT   ");
+
+        lcd.setCursor(0, 3);
+        lcd.print("        WIFI        ");
+
+        return;
+      }
+    }
 
     // =================================================
     // BARIS 1
