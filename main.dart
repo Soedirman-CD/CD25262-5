@@ -1,14 +1,13 @@
 // =======================================================
 // IMPORT
 // =======================================================
-import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 
 import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
+import 'mqtt_client_factory.dart';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -16,8 +15,11 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
 
+import 'package:firebase_auth/firebase_auth.dart';
 import 'firebase_options.dart';
-
+import 'user_config.dart';
+import 'auth_page.dart';
+import 'qr_generator_page.dart';
 // =======================================================
 // THEME COLORS
 // =======================================================
@@ -75,24 +77,28 @@ class AppColors {
 }
 
 // =======================================================
-// ESP32 CONNECTION STATUS ENUM
+// ESP32 STATUS ENUM
 // =======================================================
-enum Esp32Status {
-  connecting,   // MQTT belum terhubung
-  wifiOk,       // ESP32 WiFi terhubung (dari topic)
-  mqttOk,       // MQTT terhubung ke broker
-  online,       // keduanya terhubung & data mengalir
-  offline,      // terputus
-}
+enum Esp32Status { connecting, wifiOk, mqttOk, online, offline }
+
+// =======================================================
+// DOSING STATE ENUM — sama dengan ESP32
+// =======================================================
+enum DosingState { idle, mixing, dosing, aeration }
 
 // =======================================================
 // MAIN
 // =======================================================
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  // Set callback navigasi dari KolamListPage → MQTTPage
+  // (menghindari circular import antara main.dart dan auth_page.dart)
+  onKolamTap = (context, config) {
+    Navigator.push(context,
+        MaterialPageRoute(builder: (_) => MQTTPage(config: config)));
+  };
+
   runApp(const MyApp());
 }
 
@@ -101,16 +107,12 @@ void main() async {
 // =======================================================
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: AppColors.tealMid,
-          brightness: Brightness.light,
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: AppColors.tealMid, brightness: Brightness.light),
         useMaterial3: true,
         fontFamily: 'Inter',
         scaffoldBackgroundColor: AppColors.surface,
@@ -123,7 +125,7 @@ class MyApp extends StatelessWidget {
           color: Colors.white,
         ),
       ),
-      home: const MQTTPage(),
+      home: const AuthWrapper(),
     );
   }
 }
@@ -132,13 +134,18 @@ class MyApp extends StatelessWidget {
 // MQTT PAGE
 // =======================================================
 class MQTTPage extends StatefulWidget {
-  const MQTTPage({super.key});
-
+  final KolamConfig config;
+  const MQTTPage({super.key, required this.config});
   @override
   State<MQTTPage> createState() => _MQTTPageState();
 }
 
 class _MQTTPageState extends State<MQTTPage> {
+
+  // =====================================================
+  // CONFIG KOLAM
+  // =====================================================
+  KolamConfig get _cfg => widget.config;
 
   // =====================================================
   // FIREBASE
@@ -148,13 +155,10 @@ class _MQTTPageState extends State<MQTTPage> {
   // =====================================================
   // MQTT CLIENT
   // =====================================================
-  final client = MqttServerClient(
-    '007d3469a2244841a48f1259a6b6494e.s1.eu.hivemq.cloud',
-    'flutter_client',
-  );
+  late final MqttClient client;
 
   // =====================================================
-  // STATE — MQTT & SENSOR
+  // STATE — SENSOR & SISTEM
   // =====================================================
   String connectionStatus = "Disconnected";
   String systemStatus     = "DISCONNECT";
@@ -175,16 +179,29 @@ class _MQTTPageState extends State<MQTTPage> {
   // =====================================================
   // STATE — ESP32 CONNECTION
   // =====================================================
-  // Status gabungan: MQTT + WiFi ESP32 (dari topic)
   Esp32Status _esp32Status   = Esp32Status.connecting;
-  bool        _esp32WifiOk   = false;   // dari kolam1/status/wifi
-  bool        _mqttConnected = false;   // dari onConnected / onDisconnected
-  String      _esp32Ip       = "";      // opsional: IP ESP32 jika dikirim
-
-  // Overlay "Connecting" — fullscreen blocking
+  bool        _esp32WifiOk   = false;
+  bool        _mqttConnected = false;
+  String      _esp32Ip       = "";
   OverlayEntry? _connectingOverlay;
-  // Apakah toast "Connected" sudah pernah ditampilkan (hindari duplikat)
   bool _connectedToastShown = false;
+
+  // =====================================================
+  // STATE — COUNTDOWN DOSING
+  // Durasi total (ms) sama dengan konstanta di ESP32
+  // =====================================================
+  static const int _mixingTotal   = 60;    // detik
+  static const int _dosingTotal   = 20;    // detik
+  static const int _aerationTotal = 900;   // detik (15 menit)
+
+  DosingState _dosingState      = DosingState.idle;
+  int         _countdownSeconds = 0;   // sisa waktu dari ESP32
+  Timer?      _countdownTimer;         // timer lokal 1 detik
+
+  // Flag: apakah aerasi backup adalah bagian dari sequence dosing pH
+  // (MIXING → DOSING → AERATION). Jika true, countdown 15 menit tampil.
+  // Jika false (aerasi karena DO rendah), tidak ada countdown.
+  bool _dosingSequenceActive = false;
 
   // =====================================================
   // HISTORY DATA
@@ -200,59 +217,199 @@ class _MQTTPageState extends State<MQTTPage> {
   @override
   void initState() {
     super.initState();
-    // Tampilkan overlay connecting langsung saat app buka
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _showConnectingOverlay();
-    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _showConnectingOverlay());
     connectMQTT();
     loadHistoryData();
   }
 
   @override
   void dispose() {
+    _countdownTimer?.cancel();
     _connectingOverlay?.remove();
     client.disconnect();
     super.dispose();
   }
 
   // =====================================================
+  // UPDATE DOSING STATE & COUNTDOWN
+  //
+  // Sequence dosing pH (mode AUTO):
+  //   MIXING_DOLOMIT  → countdown 60 detik  (ungu)
+  //   INJEKSI_PH      → countdown 20 detik  (amber)
+  //   AERATOR_BACKUP_ON setelah injeksi
+  //                   → countdown 15 menit  (teal)
+  //
+  // AERATOR_BACKUP_ON karena DO rendah → TIDAK ada countdown
+  // Mode MANUAL → selalu idle, tidak ada countdown
+  // =====================================================
+  void _updateDosingState(String status) {
+    DosingState newState;
+    int totalSeconds;
+
+    // Mode manual -> paksa idle
+    if (!autoMode) {
+      _dosingSequenceActive = false;
+      _stopCountdown();
+      return;
+    }
+
+    switch (status) {
+      case "MIXING_DOLOMIT":
+        // Awal sequence dosing pH
+        _dosingSequenceActive = true;
+        newState     = DosingState.mixing;
+        totalSeconds = _mixingTotal;
+        break;
+
+      case "INJEKSI_PH":
+        // Lanjutan sequence — pastikan flag aktif
+        _dosingSequenceActive = true;
+        newState     = DosingState.dosing;
+        totalSeconds = _dosingTotal;
+        break;
+
+      case "AERATOR_BACKUP_ON":
+        if (_dosingSequenceActive) {
+          // Aerasi backup sebagai bagian akhir sequence dosing → countdown 15 menit
+          newState     = DosingState.aeration;
+          totalSeconds = _aerationTotal;
+        } else {
+          // Aerasi backup karena DO rendah → tidak ada countdown
+          _stopCountdown();
+          return;
+        }
+        break;
+
+      default:
+        // Status lain (NORMAL, LOW_PH, HIGH_PH, dll) → reset sequence & countdown
+        _dosingSequenceActive = false;
+        newState     = DosingState.idle;
+        totalSeconds = 0;
+    }
+
+    // Jika state berubah, reset countdown & timer
+    if (newState != _dosingState) {
+      _dosingState      = newState;
+      _countdownSeconds = totalSeconds;
+      _countdownTimer?.cancel();
+
+      if (newState != DosingState.idle) {
+        _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (!mounted) return;
+          setState(() {
+            if (_countdownSeconds > 0) {
+              _countdownSeconds--;
+            } else {
+              // Countdown habis
+              _countdownTimer?.cancel();
+              if (_dosingState == DosingState.aeration) {
+                // Sequence selesai, reset flag
+                _dosingSequenceActive = false;
+              }
+              _dosingState      = DosingState.idle;
+              _countdownSeconds = 0;
+            }
+          });
+        });
+      }
+    }
+  }
+
+  // =====================================================
+  // STOP COUNTDOWN — reset ke idle
+  // =====================================================
+  void _stopCountdown() {
+    _countdownTimer?.cancel();
+    _dosingSequenceActive = false;
+    if (_dosingState == DosingState.idle) return;
+    setState(() {
+      _dosingState      = DosingState.idle;
+      _countdownSeconds = 0;
+    });
+  }
+
+  // Format countdown: mm:ss atau ss tergantung durasi
+  String _formatCountdown(int seconds) {
+    if (seconds >= 60) {
+      final m = seconds ~/ 60;
+      final s = seconds % 60;
+      return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+    return '${seconds}s';
+  }
+
+  // Warna & label countdown berdasarkan state
+  Color get _countdownColor {
+    switch (_dosingState) {
+      case DosingState.mixing:   return AppColors.purpleMid;
+      case DosingState.dosing:   return AppColors.amberBorder;
+      case DosingState.aeration: return AppColors.tealMid;
+      default:                   return AppColors.grayMid;
+    }
+  }
+
+  Color get _countdownBg {
+    switch (_dosingState) {
+      case DosingState.mixing:   return AppColors.purpleLight;
+      case DosingState.dosing:   return AppColors.amberLight;
+      case DosingState.aeration: return AppColors.tealLight;
+      default:                   return AppColors.grayLight;
+    }
+  }
+
+  IconData get _countdownIcon {
+    switch (_dosingState) {
+      case DosingState.mixing:   return Icons.rotate_right_rounded;
+      case DosingState.dosing:   return Icons.science_outlined;
+      case DosingState.aeration: return Icons.air_rounded;
+      default:                   return Icons.check_circle_outline;
+    }
+  }
+
+  String get _countdownLabel {
+    switch (_dosingState) {
+      case DosingState.mixing:   return "Pengadukan dolomit";
+      case DosingState.dosing:   return "Injeksi pH";
+      case DosingState.aeration: return "Aerasi backup";
+      default:                   return "";
+    }
+  }
+
+  int get _countdownTotal {
+    switch (_dosingState) {
+      case DosingState.mixing:   return _mixingTotal;
+      case DosingState.dosing:   return _dosingTotal;
+      case DosingState.aeration: return _aerationTotal;
+      default:                   return 1;
+    }
+  }
+
+  // =====================================================
   // UPDATE ESP32 STATUS
-  // Dipanggil setiap kali ada perubahan _mqttConnected
-  // atau _esp32WifiOk agar status gabungan selalu sinkron
   // =====================================================
   void _updateEsp32Status() {
     Esp32Status newStatus;
-
     if (!_mqttConnected) {
-      // MQTT belum/tidak terhubung → pasti connecting/offline
       newStatus = Esp32Status.connecting;
-    } else if (_mqttConnected && !_esp32WifiOk) {
-      // MQTT terhubung tapi belum terima konfirmasi WiFi ESP32
+    } else if (!_esp32WifiOk) {
       newStatus = Esp32Status.mqttOk;
     } else {
-      // MQTT terhubung + WiFi ESP32 terkonfirmasi
       newStatus = Esp32Status.online;
     }
 
-    final wasConnecting = _esp32Status == Esp32Status.connecting ||
-                          _esp32Status == Esp32Status.offline;
-    final nowOnline     = newStatus == Esp32Status.mqttOk ||
-                          newStatus == Esp32Status.online;
+    final wasConnecting = _esp32Status == Esp32Status.connecting || _esp32Status == Esp32Status.offline;
+    final nowOnline     = newStatus == Esp32Status.mqttOk || newStatus == Esp32Status.online;
 
     setState(() => _esp32Status = newStatus);
 
-    // Transisi dari offline/connecting → online: tutup overlay, tampilkan toast
     if (wasConnecting && nowOnline) {
       _removeConnectingOverlay();
       if (!_connectedToastShown) {
         _connectedToastShown = true;
         _showConnectedToast();
-        // Reset flag setelah 5 detik supaya toast bisa muncul lagi jika putus-konek ulang
         Future.delayed(const Duration(seconds: 5), () => _connectedToastShown = false);
       }
     }
-
-    // Transisi dari online → offline: tampilkan overlay connecting
     if (!wasConnecting && newStatus == Esp32Status.connecting) {
       _connectedToastShown = false;
       _showConnectingOverlay();
@@ -263,63 +420,60 @@ class _MQTTPageState extends State<MQTTPage> {
   // CONNECT MQTT
   // =====================================================
   Future<void> connectMQTT() async {
-    client.port = 8883;
-    client.secure = true;
-    client.securityContext = SecurityContext.defaultContext;
-    client.keepAlivePeriod = 20;
-    client.autoReconnect = true;
-    client.logging(on: false);
+    // Init client dengan broker dari config akun.
+    // createMqttClient() otomatis pilih implementasi sesuai
+    // platform: MqttServerClient (native, TCP+TLS port 8883)
+    // atau MqttBrowserClient (web, WebSocket/TLS port 8884).
+    client = createMqttClient(
+      _cfg.mqttBroker,
+      'flutter_${_cfg.kolamId.substring(0, 8)}',
+    );
     client.onConnected    = onConnected;
     client.onDisconnected = onDisconnected;
     client.setProtocolV311();
-
-    // ── Last Will Testament ───────────────────────────
-    // Broker otomatis publish pesan ini jika ESP32 putus
-    // (diset dari sisi ESP32, bukan Flutter)
     client.connectionMessage = MqttConnectMessage()
         .withClientIdentifier('flutter_client')
-        .authenticateAs('Test123', 'Test1234')
+        .authenticateAs(_cfg.mqttUser, _cfg.mqttPassword)
         .startClean();
 
-    try {
-      await client.connect();
-    } catch (e) {
-      debugPrint("MQTT ERROR: $e");
-      client.disconnect();
-    }
+    try { await client.connect(); }
+    catch (e) { debugPrint("MQTT ERROR: $e"); client.disconnect(); }
 
     if (client.connectionStatus!.state == MqttConnectionState.connected) {
-      client.subscribe('kolam1/sensor/#',    MqttQos.atLeastOnce);
-      client.subscribe('kolam1/status/#',    MqttQos.atLeastOnce);
-      // ── Subscribe status WiFi ESP32 ──────────────────
-      // ESP32 harus publish ke topic ini saat WiFi terhubung
-      // Payload: {"connected": true, "ssid": "NamaWifi", "ip": "192.168.x.x"}
-      client.subscribe('kolam1/device/wifi', MqttQos.atLeastOnce);
+      client.subscribe(_cfg.topic('sensor/#'),    MqttQos.atLeastOnce);
+      client.subscribe(_cfg.topic('status/#'),    MqttQos.atLeastOnce);
+      client.subscribe(_cfg.topic('device/wifi'), MqttQos.atLeastOnce);
     }
 
     client.updates?.listen((List<MqttReceivedMessage<MqttMessage>> messages) {
       final recMess = messages[0].payload as MqttPublishMessage;
-      final payload = MqttPublishPayload.bytesToStringAsString(
-        recMess.payload.message,
-      );
-      final topic = messages[0].topic;
+      final payload = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+      final topic   = messages[0].topic;
 
       try {
         final data = jsonDecode(payload);
         setState(() {
-          if (topic == 'kolam1/sensor/suhu')              suhu = data['value'].toStringAsFixed(2);
-          if (topic == 'kolam1/sensor/ph')                ph   = data['value'].toStringAsFixed(2);
-          if (topic == 'kolam1/sensor/do')                dissolvedOxygen = data['value'].toStringAsFixed(2);
-          if (topic == 'kolam1/status/mode')              autoMode = data['mode'] == "AUTO";
-          if (topic == 'kolam1/status/system')            systemStatus = data['status'];
-          if (topic == 'kolam1/status/aerator_backup')    aeratorBackup = data['state'];
-          if (topic == 'kolam1/status/pengaduk_dolomit')  pengadukDolomit = data['state'];
-          if (topic == 'kolam1/status/pompa_dolomit')     pompaDolomit = data['state'];
-          if (topic == 'kolam1/status/solenoid_in')       solenoidIn   = data['state'];
-          if (topic == 'kolam1/status/solenoid_out')      solenoidOut  = data['state'];
+          if (topic == _cfg.topic('sensor/suhu'))             suhu = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('sensor/ph'))               ph   = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('sensor/do'))               dissolvedOxygen = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('status/mode')) {
+            autoMode = data['mode'] == "AUTO";
+            // Jika beralih ke MANUAL, hentikan countdown
+            if (!autoMode) _stopCountdown();
+          }
+          if (topic == _cfg.topic('status/aerator_backup'))   aeratorBackup = data['state'];
+          if (topic == _cfg.topic('status/pengaduk_dolomit')) pengadukDolomit = data['state'];
+          if (topic == _cfg.topic('status/pompa_dolomit'))    pompaDolomit = data['state'];
+          if (topic == _cfg.topic('status/solenoid_in'))      solenoidIn = data['state'];
+          if (topic == _cfg.topic('status/solenoid_out'))     solenoidOut = data['state'];
 
-          // ── Opsi A: terima status WiFi ESP32 ───────────
-          if (topic == 'kolam1/device/wifi') {
+          if (topic == _cfg.topic('status/system')) {
+            systemStatus = data['status'];
+            // ── Update countdown berdasarkan status sistem ──
+            _updateDosingState(systemStatus);
+          }
+
+          if (topic == _cfg.topic('device/wifi')) {
             _esp32WifiOk = data['connected'] == true;
             _esp32Ip     = data['ip'] ?? "";
             _updateEsp32Status();
@@ -332,26 +486,15 @@ class _MQTTPageState extends State<MQTTPage> {
           loadHistoryData();
           lastLogTime = DateTime.now();
         }
-      } catch (e) {
-        debugPrint("JSON ERROR: $e");
-      }
+      } catch (e) { debugPrint("JSON ERROR: $e"); }
     });
   }
 
-  // =====================================================
-  // ON CONNECTED — Opsi B: MQTT terhubung
-  // =====================================================
   void onConnected() {
-    setState(() {
-      connectionStatus = "Connected";
-      _mqttConnected   = true;
-    });
+    setState(() { connectionStatus = "Connected"; _mqttConnected = true; });
     _updateEsp32Status();
   }
 
-  // =====================================================
-  // ON DISCONNECTED — Opsi B: MQTT putus
-  // =====================================================
   void onDisconnected() {
     setState(() {
       connectionStatus = "Disconnected";
@@ -359,15 +502,67 @@ class _MQTTPageState extends State<MQTTPage> {
       _mqttConnected   = false;
       _esp32WifiOk     = false;
     });
+    _countdownTimer?.cancel();
+    setState(() { _dosingState = DosingState.idle; _countdownSeconds = 0; });
     _updateEsp32Status();
   }
 
   // =====================================================
-  // OVERLAY: CONNECTING — fullscreen, tidak bisa ditutup
+  // LOGOUT
+  // =====================================================
+  Future<void> _logout() async {
+    // Konfirmasi logout
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text("Keluar", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        content: Text(
+          "Apakah Anda yakin ingin keluar dari akun Anda?",
+          style: const TextStyle(fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Batal", style: TextStyle(color: Color(0xFF5F5E5A))),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE24B4A),
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: const Text("Keluar"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    // Putuskan MQTT
+    try { client.disconnect(); } catch (_) {}
+
+    // Hapus sesi Firebase Auth
+    await FirebaseAuth.instance.signOut();
+
+    // MQTTPage ini berada di atas stack Navigator (di-push dari
+    // KolamListPage), sehingga StreamBuilder di AuthWrapper yang
+    // sudah rebuild ke AuthPage tidak akan terlihat selama route
+    // ini masih ada di atas. Pop semua route sampai balik ke root
+    // (AuthWrapper) agar AuthPage langsung terlihat.
+    if (mounted) {
+      Navigator.of(context).popUntil((route) => route.isFirst);
+    }
+  }
+
+  // =====================================================
+  // OVERLAY CONNECTING
   // =====================================================
   void _showConnectingOverlay() {
-    if (_connectingOverlay != null) return; // jangan dobel
-
+    if (_connectingOverlay != null) return;
     _connectingOverlay = OverlayEntry(
       builder: (_) => Material(
         color: Colors.black.withOpacity(0.6),
@@ -378,62 +573,28 @@ class _MQTTPageState extends State<MQTTPage> {
             decoration: BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.circular(24),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.14),
-                  blurRadius: 32,
-                  offset: const Offset(0, 8),
-                ),
-              ],
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.14), blurRadius: 32, offset: const Offset(0, 8))],
             ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Ikon ESP32 / perangkat
                 Container(
-                  width: 68,
-                  height: 68,
-                  decoration: const BoxDecoration(
-                    color: AppColors.grayLight,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(
-                    Icons.developer_board_rounded,
-                    size: 34,
-                    color: AppColors.grayMid,
-                  ),
+                  width: 68, height: 68,
+                  decoration: const BoxDecoration(color: AppColors.grayLight, shape: BoxShape.circle),
+                  child: const Icon(Icons.developer_board_rounded, size: 34, color: AppColors.grayMid),
                 ),
                 const SizedBox(height: 20),
-                const Text(
-                  "Menghubungkan perangkat",
-                  style: TextStyle(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF1A1A1A),
-                  ),
-                ),
+                const Text("Menghubungkan perangkat", style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: Color(0xFF1A1A1A))),
                 const SizedBox(height: 8),
-                const Text(
-                  "Menunggu ESP32 terhubung\nke jaringan WiFi...",
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: AppColors.grayText,
-                    height: 1.5,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
+                const Text("Menunggu ESP32 terhubung\nke jaringan WiFi...", style: TextStyle(fontSize: 13, color: AppColors.grayText, height: 1.5), textAlign: TextAlign.center),
                 const SizedBox(height: 24),
-                // Step indikator
-                _connectingSteps(),
+                _stepRow(icon: Icons.wifi_rounded,  label: "ESP32 → WiFi",        done: _esp32WifiOk,   active: !_esp32WifiOk),
+                const SizedBox(height: 8),
+                _stepRow(icon: Icons.cloud_rounded, label: "ESP32 → Broker MQTT", done: _mqttConnected, active: _esp32WifiOk && !_mqttConnected),
                 const SizedBox(height: 24),
-                // Spinner
                 const SizedBox(
-                  width: 26,
-                  height: 26,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2.5,
-                    valueColor: AlwaysStoppedAnimation<Color>(AppColors.grayMid),
-                  ),
+                  width: 26, height: 26,
+                  child: CircularProgressIndicator(strokeWidth: 2.5, valueColor: AlwaysStoppedAnimation<Color>(AppColors.grayMid)),
                 ),
               ],
             ),
@@ -441,187 +602,66 @@ class _MQTTPageState extends State<MQTTPage> {
         ),
       ),
     );
-
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) Overlay.of(context).insert(_connectingOverlay!);
     });
   }
 
-  // ── Step indikator di dalam overlay ──
-  Widget _connectingSteps() {
-    return Column(
-      children: [
-        _stepRow(
-          icon: Icons.wifi_rounded,
-          label: "ESP32 → WiFi",
-          done: _esp32WifiOk,
-          active: !_esp32WifiOk,
-        ),
-        const SizedBox(height: 8),
-        _stepRow(
-          icon: Icons.cloud_rounded,
-          label: "ESP32 → Broker MQTT",
-          done: _mqttConnected,
-          active: _esp32WifiOk && !_mqttConnected,
-        ),
-      ],
-    );
-  }
-
-  Widget _stepRow({
-    required IconData icon,
-    required String label,
-    required bool done,
-    required bool active,
-  }) {
-    final color = done
-        ? AppColors.tealMid
-        : active
-            ? AppColors.amberBorder
-            : AppColors.grayMid;
-    final bg = done
-        ? AppColors.tealLight
-        : active
-            ? AppColors.amberLight
-            : AppColors.grayLight;
-
+  Widget _stepRow({required IconData icon, required String label, required bool done, required bool active}) {
+    final color = done ? AppColors.tealMid : active ? AppColors.amberBorder : AppColors.grayMid;
+    final bg    = done ? AppColors.tealLight : active ? AppColors.amberLight : AppColors.grayLight;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Container(
-          width: 30,
-          height: 30,
-          decoration: BoxDecoration(color: bg, shape: BoxShape.circle),
-          child: Icon(
-            done ? Icons.check_rounded : icon,
-            size: 16,
-            color: color,
-          ),
-        ),
+        Container(width: 30, height: 30, decoration: BoxDecoration(color: bg, shape: BoxShape.circle),
+            child: Icon(done ? Icons.check_rounded : icon, size: 16, color: color)),
         const SizedBox(width: 10),
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 13,
-            fontWeight: FontWeight.w500,
-            color: color,
-          ),
-        ),
+        Text(label, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: color)),
       ],
     );
   }
 
-  // =====================================================
-  // HAPUS OVERLAY CONNECTING
-  // =====================================================
-  void _removeConnectingOverlay() {
-    _connectingOverlay?.remove();
-    _connectingOverlay = null;
-  }
+  void _removeConnectingOverlay() { _connectingOverlay?.remove(); _connectingOverlay = null; }
 
-  // =====================================================
-  // TOAST: CONNECTED — slide dari atas, auto-dismiss
-  // =====================================================
   void _showConnectedToast() {
-    final isFullyOnline = _esp32Status == Esp32Status.online;
-
+    final isOnline = _esp32Status == Esp32Status.online;
     OverlayEntry? toast;
     toast = OverlayEntry(
       builder: (ctx) => Positioned(
-        top: MediaQuery.of(ctx).padding.top + 14,
-        left: 16,
-        right: 16,
+        top: MediaQuery.of(ctx).padding.top + 14, left: 16, right: 16,
         child: Material(
           color: Colors.transparent,
           child: TweenAnimationBuilder<double>(
             tween: Tween(begin: 0.0, end: 1.0),
             duration: const Duration(milliseconds: 350),
             curve: Curves.easeOutCubic,
-            builder: (_, v, child) => Transform.translate(
-              offset: Offset(0, -28 * (1 - v)),
-              child: Opacity(opacity: v, child: child),
-            ),
+            builder: (_, v, child) => Transform.translate(offset: Offset(0, -28 * (1 - v)), child: Opacity(opacity: v, child: child)),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               decoration: BoxDecoration(
-                color: isFullyOnline ? AppColors.tealLight : AppColors.amberLight,
+                color: isOnline ? AppColors.tealLight : AppColors.amberLight,
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: isFullyOnline ? AppColors.tealBorder : AppColors.amberBorder,
-                  width: 0.5,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: (isFullyOnline ? AppColors.tealMid : AppColors.amberBorder)
-                        .withOpacity(0.15),
-                    blurRadius: 20,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
+                border: Border.all(color: isOnline ? AppColors.tealBorder : AppColors.amberBorder, width: 0.5),
+                boxShadow: [BoxShadow(color: (isOnline ? AppColors.tealMid : AppColors.amberBorder).withOpacity(0.15), blurRadius: 20, offset: const Offset(0, 4))],
               ),
               child: Row(
                 children: [
-                  // Ikon
                   Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: isFullyOnline ? AppColors.tealIcon : AppColors.amberIcon,
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      isFullyOnline
-                          ? Icons.developer_board_rounded
-                          : Icons.cloud_done_rounded,
-                      size: 20,
-                      color: isFullyOnline
-                          ? AppColors.tealIconText
-                          : AppColors.amberIconText,
-                    ),
+                    width: 40, height: 40,
+                    decoration: BoxDecoration(color: isOnline ? AppColors.tealIcon : AppColors.amberIcon, shape: BoxShape.circle),
+                    child: Icon(isOnline ? Icons.developer_board_rounded : Icons.cloud_done_rounded, size: 20, color: isOnline ? AppColors.tealIconText : AppColors.amberIconText),
                   ),
                   const SizedBox(width: 12),
-                  // Teks
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          isFullyOnline
-                              ? "ESP32 terhubung"
-                              : "Broker MQTT terhubung",
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: isFullyOnline
-                                ? AppColors.tealDark
-                                : AppColors.amberDark,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          isFullyOnline
-                              ? "WiFi & MQTT aktif${_esp32Ip.isNotEmpty ? ' · $_esp32Ip' : ''}"
-                              : "Menunggu konfirmasi WiFi ESP32...",
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: isFullyOnline
-                                ? AppColors.tealLabel
-                                : AppColors.amberText,
-                          ),
-                        ),
-                      ],
-                    ),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      Text(isOnline ? "ESP32 terhubung" : "Broker MQTT terhubung",
+                          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: isOnline ? AppColors.tealDark : AppColors.amberDark)),
+                      const SizedBox(height: 2),
+                      Text(isOnline ? "WiFi & MQTT aktif${_esp32Ip.isNotEmpty ? ' · $_esp32Ip' : ''}" : "Menunggu konfirmasi WiFi ESP32...",
+                          style: TextStyle(fontSize: 12, color: isOnline ? AppColors.tealLabel : AppColors.amberText)),
+                    ]),
                   ),
-                  // Dot status
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: isFullyOnline ? AppColors.tealMid : AppColors.amberBorder,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
+                  Container(width: 8, height: 8, decoration: BoxDecoration(color: isOnline ? AppColors.tealMid : AppColors.amberBorder, shape: BoxShape.circle)),
                 ],
               ),
             ),
@@ -629,7 +669,6 @@ class _MQTTPageState extends State<MQTTPage> {
         ),
       ),
     );
-
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         Overlay.of(context).insert(toast!);
@@ -639,11 +678,11 @@ class _MQTTPageState extends State<MQTTPage> {
   }
 
   // =====================================================
-  // SAVE SENSOR DATA
+  // FIREBASE
   // =====================================================
   Future<void> saveSensorData() async {
     try {
-      await firestore.collection('sensor_log').add({
+      await firestore.collection('kolam/${_cfg.kolamId}/sensor_log').add({
         'timestamp': Timestamp.now(),
         'suhu': double.tryParse(suhu) ?? 0,
         'ph':   double.tryParse(ph)   ?? 0,
@@ -652,44 +691,30 @@ class _MQTTPageState extends State<MQTTPage> {
         'auto_mode': autoMode,
       });
       setState(() => logCount++);
-    } catch (e) {
-      debugPrint("FIREBASE ERROR: $e");
-    }
+    } catch (e) { debugPrint("FIREBASE ERROR: $e"); }
   }
 
-  // =====================================================
-  // LOAD FIREBASE HISTORY
-  // =====================================================
   Future<void> loadHistoryData() async {
     try {
-      final oneHourAgo = Timestamp.fromDate(
-        DateTime.now().subtract(const Duration(hours: 1)),
-      );
+      final oneHourAgo = Timestamp.fromDate(DateTime.now().subtract(const Duration(hours: 1)));
       final snapshot = await firestore
-          .collection('sensor_log')
+          .collection('kolam/${_cfg.kolamId}/sensor_log')
           .where('timestamp', isGreaterThan: oneHourAgo)
           .orderBy('timestamp')
           .get();
 
-      suhuHistory.clear();
-      phHistory.clear();
-      doHistory.clear();
-      timeLabels.clear();
-
+      suhuHistory.clear(); phHistory.clear(); doHistory.clear(); timeLabels.clear();
       int index = 0;
       for (var doc in snapshot.docs) {
         final data = doc.data();
         suhuHistory.add(FlSpot(index.toDouble(), (data['suhu'] ?? 0).toDouble()));
         phHistory.add(FlSpot(index.toDouble(),   (data['ph']   ?? 0).toDouble()));
         doHistory.add(FlSpot(index.toDouble(),   (data['do']   ?? 0).toDouble()));
-        final ts = (data['timestamp'] as Timestamp).toDate();
-        timeLabels.add(DateFormat('HH:mm').format(ts));
+        timeLabels.add(DateFormat('HH:mm').format((data['timestamp'] as Timestamp).toDate()));
         index++;
       }
       setState(() => logCount = snapshot.docs.length);
-    } catch (e) {
-      debugPrint("LOAD HISTORY ERROR: $e");
-    }
+    } catch (e) { debugPrint("LOAD HISTORY ERROR: $e"); }
   }
 
   // =====================================================
@@ -704,7 +729,7 @@ class _MQTTPageState extends State<MQTTPage> {
   void publishMode(String mode) {
     final builder = MqttClientPayloadBuilder();
     builder.addString(jsonEncode({"mode": mode}));
-    client.publishMessage('kolam1/system/mode', MqttQos.atLeastOnce, builder.payload!);
+    client.publishMessage(_cfg.topic('system/mode'), MqttQos.atLeastOnce, builder.payload!);
   }
 
   // =====================================================
@@ -734,17 +759,19 @@ class _MQTTPageState extends State<MQTTPage> {
 
   String get statusLabel {
     switch (systemStatus) {
-      case "NORMAL":     return "Semua parameter normal";
-      case "LOW_DO":     return "Oksigen terlarut rendah";
-      case "LOW_PH":     return "pH berada di bawah ambang batas";
-      case "HIGH_PH":    return "pH berada di atas ambang batas";
-      case "FAILSAFE":   return "Mode failsafe aktif";
-      case "DISCONNECT": return "ESP32 tidak terhubung";
-      default:           return "-";
+      case "NORMAL":          return "Semua parameter normal";
+      case "LOW_DO":          return "Oksigen terlarut rendah";
+      case "LOW_PH":          return "pH berada di bawah ambang batas";
+      case "HIGH_PH":         return "pH berada di atas ambang batas";
+      case "FAILSAFE":        return "Mode failsafe aktif";
+      case "MIXING_DOLOMIT":  return "Sedang mengaduk dolomit";
+      case "INJEKSI_PH":      return "Sedang injeksi pH";
+      case "AERATOR_BACKUP_ON": return "Aerasi backup aktif";
+      case "DISCONNECT":      return "ESP32 tidak terhubung";
+      default:                return "-";
     }
   }
 
-  // ── Label & warna badge ESP32 di header ──
   String get _esp32BadgeLabel {
     switch (_esp32Status) {
       case Esp32Status.connecting: return "Connecting...";
@@ -802,6 +829,11 @@ class _MQTTPageState extends State<MQTTPage> {
               const SizedBox(height: 16),
               _buildAlertBanner(),
               const SizedBox(height: 14),
+              // ── Countdown card — hanya tampil saat dosing aktif ──
+              if (_dosingState != DosingState.idle) ...[
+                _buildCountdownCard(),
+                const SizedBox(height: 14),
+              ],
               _buildSensorGrid(),
               const SizedBox(height: 14),
               _buildChartCard(),
@@ -822,12 +854,8 @@ class _MQTTPageState extends State<MQTTPage> {
     return Row(
       children: [
         Container(
-          width: 42,
-          height: 42,
-          decoration: BoxDecoration(
-            color: AppColors.tealMid,
-            borderRadius: BorderRadius.circular(12),
-          ),
+          width: 42, height: 42,
+          decoration: BoxDecoration(color: AppColors.tealMid, borderRadius: BorderRadius.circular(12)),
           child: const Icon(Icons.water, color: Colors.white, size: 22),
         ),
         const SizedBox(width: 12),
@@ -835,22 +863,53 @@ class _MQTTPageState extends State<MQTTPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                "IoT Kolam Ikan",
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  color: Color(0xFF1A1A1A),
-                ),
-              ),
-              Text(
-                "Kolam 1 · Monitoring real-time",
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
-              ),
+              const Text("IoT Kolam Ikan", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF1A1A1A))),
+              Text("${_cfg.kolamName}${_cfg.isOwner ? "" : " · Tamu"}", style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
             ],
           ),
         ),
-        // ── Badge status ESP32 (gabungan WiFi + MQTT) ──
+        // ── Tombol Logout ──
+        IconButton(
+          onPressed: _logout,
+          icon: const Icon(Icons.logout_rounded, size: 20),
+          color: const Color(0xFFB4B2A9),
+          tooltip: "Keluar",
+          style: IconButton.styleFrom(
+            backgroundColor: const Color(0xFFF1EFE8),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            minimumSize: const Size(36, 36),
+            padding: EdgeInsets.zero,
+          ),
+        ),
+        const SizedBox(width: 8),
+        // ── Tombol QR (hanya untuk pemilik) ──
+        if (_cfg.isOwner)
+          IconButton(
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => QRGeneratorPage(config: _cfg))),
+            icon: const Icon(Icons.qr_code_rounded, size: 20),
+            color: const Color(0xFFB4B2A9),
+            tooltip: "Bagikan akses kolam",
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xFFF1EFE8),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              minimumSize: const Size(36, 36), padding: EdgeInsets.zero,
+            ),
+          ),
+        const SizedBox(width: 6),
+        // ── Tombol kembali ke daftar kolam ──
+        IconButton(
+          onPressed: () => Navigator.pop(context),
+          icon: const Icon(Icons.grid_view_rounded, size: 20),
+          color: const Color(0xFFB4B2A9),
+          tooltip: "Daftar kolam",
+          style: IconButton.styleFrom(
+            backgroundColor: const Color(0xFFF1EFE8),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            minimumSize: const Size(36, 36), padding: EdgeInsets.zero,
+          ),
+        ),
+        const SizedBox(width: 6),
         AnimatedContainer(
           duration: const Duration(milliseconds: 400),
           curve: Curves.easeInOut,
@@ -858,34 +917,16 @@ class _MQTTPageState extends State<MQTTPage> {
           decoration: BoxDecoration(
             color: _esp32BadgeBg,
             borderRadius: BorderRadius.circular(99),
-            border: Border.all(
-              color: _esp32BadgeFg.withOpacity(0.3),
-              width: 0.5,
-            ),
+            border: Border.all(color: _esp32BadgeFg.withOpacity(0.3), width: 0.5),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Spinner saat connecting, ikon biasa saat lainnya
               _esp32Status == Esp32Status.connecting
-                  ? SizedBox(
-                      width: 11,
-                      height: 11,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 1.5,
-                        valueColor: AlwaysStoppedAnimation<Color>(_esp32BadgeFg),
-                      ),
-                    )
+                  ? SizedBox(width: 11, height: 11, child: CircularProgressIndicator(strokeWidth: 1.5, valueColor: AlwaysStoppedAnimation<Color>(_esp32BadgeFg)))
                   : Icon(_esp32BadgeIcon, size: 13, color: _esp32BadgeFg),
               const SizedBox(width: 6),
-              Text(
-                _esp32BadgeLabel,
-                style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
-                  color: _esp32BadgeFg,
-                ),
-              ),
+              Text(_esp32BadgeLabel, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: _esp32BadgeFg)),
             ],
           ),
         ),
@@ -908,19 +949,9 @@ class _MQTTPageState extends State<MQTTPage> {
       child: Row(
         children: [
           Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: statusColor.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-              systemStatus == "NORMAL"
-                  ? Icons.check_circle_outline
-                  : Icons.warning_amber_rounded,
-              color: statusColor,
-              size: 20,
-            ),
+            width: 38, height: 38,
+            decoration: BoxDecoration(color: statusColor.withOpacity(0.2), borderRadius: BorderRadius.circular(10)),
+            child: Icon(systemStatus == "NORMAL" ? Icons.check_circle_outline : Icons.warning_amber_rounded, color: statusColor, size: 20),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -928,40 +959,110 @@ class _MQTTPageState extends State<MQTTPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  systemStatus == "DISCONNECT"
-                      ? "ESP32 tidak terhubung"
-                      : systemStatus.replaceAll('_', ' '),
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: statusColor,
-                  ),
+                  systemStatus == "DISCONNECT" ? "ESP32 tidak terhubung" : systemStatus.replaceAll('_', ' '),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: statusColor),
                 ),
                 const SizedBox(height: 2),
-                Text(
-                  statusLabel,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: statusColor.withOpacity(0.8),
-                  ),
-                ),
+                Text(statusLabel, style: TextStyle(fontSize: 12, color: statusColor.withOpacity(0.8))),
               ],
             ),
           ),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-            decoration: BoxDecoration(
-              color: statusColor.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(99),
-            ),
-            child: Text(
-              "$now WIB",
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w500,
-                color: statusColor,
+            decoration: BoxDecoration(color: statusColor.withOpacity(0.15), borderRadius: BorderRadius.circular(99)),
+            child: Text("$now WIB", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: statusColor)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // =====================================================
+  // COUNTDOWN CARD — tampil saat mixing / dosing / aeration
+  // =====================================================
+  Widget _buildCountdownCard() {
+    final progress = _countdownTotal > 0
+        ? (_countdownSeconds / _countdownTotal).clamp(0.0, 1.0)
+        : 0.0;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: _countdownBg,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _countdownColor.withOpacity(0.3), width: 0.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              // Ikon proses
+              Container(
+                width: 36, height: 36,
+                decoration: BoxDecoration(color: _countdownColor.withOpacity(0.15), shape: BoxShape.circle),
+                child: Icon(_countdownIcon, size: 18, color: _countdownColor),
               ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _countdownLabel,
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _countdownColor),
+                    ),
+                    Text(
+                      "Proses otomatis sedang berjalan",
+                      style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7)),
+                    ),
+                  ],
+                ),
+              ),
+              // Tampilan countdown waktu besar
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(
+                  color: _countdownColor,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  _formatCountdown(_countdownSeconds),
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          // Progress bar
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 6,
+              backgroundColor: _countdownColor.withOpacity(0.12),
+              valueColor: AlwaysStoppedAnimation<Color>(_countdownColor),
             ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                "Sisa ${_formatCountdown(_countdownSeconds)}",
+                style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7)),
+              ),
+              Text(
+                "Total ${_formatCountdown(_countdownTotal)}",
+                style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.5)),
+              ),
+            ],
           ),
         ],
       ),
@@ -974,35 +1075,11 @@ class _MQTTPageState extends State<MQTTPage> {
   Widget _buildSensorGrid() {
     return Row(
       children: [
-        Expanded(child: _sensorCard(
-          label: "Suhu", value: suhu, unit: "°C",
-          icon: Icons.thermostat_outlined,
-          bgColor: AppColors.coralLight, borderColor: AppColors.coralBorder,
-          accentColor: AppColors.coralMid, labelColor: AppColors.coralLabel,
-          iconBg: AppColors.coralIcon, iconColor: AppColors.coralIconText,
-          valueColor: AppColors.coralDark, unitColor: AppColors.coralUnit,
-          statusText: _getSuhuStatus(), statusBg: _getSuhuStatusBg(), statusFg: _getSuhuStatusFg(),
-        )),
+        Expanded(child: _sensorCard(label: "Suhu", value: suhu, unit: "°C", icon: Icons.thermostat_outlined, bgColor: AppColors.coralLight, borderColor: AppColors.coralBorder, accentColor: AppColors.coralMid, labelColor: AppColors.coralLabel, iconBg: AppColors.coralIcon, iconColor: AppColors.coralIconText, valueColor: AppColors.coralDark, unitColor: AppColors.coralUnit, statusText: _getSuhuStatus(), statusBg: _getSuhuStatusBg(), statusFg: _getSuhuStatusFg())),
         const SizedBox(width: 10),
-        Expanded(child: _sensorCard(
-          label: "pH", value: ph, unit: "pH level",
-          icon: Icons.science_outlined,
-          bgColor: AppColors.purpleLight, borderColor: AppColors.purpleBorder,
-          accentColor: AppColors.purpleMid, labelColor: AppColors.purpleLabel,
-          iconBg: AppColors.purpleIcon, iconColor: AppColors.purpleIconText,
-          valueColor: AppColors.purpleDark, unitColor: AppColors.purpleUnit,
-          statusText: _getPhStatus(), statusBg: _getPhStatusBg(), statusFg: _getPhStatusFg(),
-        )),
+        Expanded(child: _sensorCard(label: "pH", value: ph, unit: "pH level", icon: Icons.science_outlined, bgColor: AppColors.purpleLight, borderColor: AppColors.purpleBorder, accentColor: AppColors.purpleMid, labelColor: AppColors.purpleLabel, iconBg: AppColors.purpleIcon, iconColor: AppColors.purpleIconText, valueColor: AppColors.purpleDark, unitColor: AppColors.purpleUnit, statusText: _getPhStatus(), statusBg: _getPhStatusBg(), statusFg: _getPhStatusFg())),
         const SizedBox(width: 10),
-        Expanded(child: _sensorCard(
-          label: "DO", value: dissolvedOxygen, unit: "mg/L",
-          icon: Icons.water_drop_outlined,
-          bgColor: AppColors.tealLight, borderColor: AppColors.tealBorder,
-          accentColor: AppColors.tealMid, labelColor: AppColors.tealLabel,
-          iconBg: AppColors.tealIcon, iconColor: AppColors.tealIconText,
-          valueColor: AppColors.tealDark, unitColor: AppColors.tealUnit,
-          statusText: _getDoStatus(), statusBg: _getDoStatusBg(), statusFg: _getDoStatusFg(),
-        )),
+        Expanded(child: _sensorCard(label: "DO", value: dissolvedOxygen, unit: "mg/L", icon: Icons.water_drop_outlined, bgColor: AppColors.tealLight, borderColor: AppColors.tealBorder, accentColor: AppColors.tealMid, labelColor: AppColors.tealLabel, iconBg: AppColors.tealIcon, iconColor: AppColors.tealIconText, valueColor: AppColors.tealDark, unitColor: AppColors.tealUnit, statusText: _getDoStatus(), statusBg: _getDoStatusBg(), statusFg: _getDoStatusFg())),
       ],
     );
   }
@@ -1010,28 +1087,16 @@ class _MQTTPageState extends State<MQTTPage> {
   String _getSuhuStatus() { final v = double.tryParse(suhu); if (v == null) return "-"; if (v >= 26 && v <= 30) return "Normal"; return v < 26 ? "Dingin" : "Panas"; }
   Color _getSuhuStatusBg() { final v = double.tryParse(suhu); if (v == null) return AppColors.grayLight; if (v >= 26 && v <= 30) return AppColors.greenLight; return AppColors.amberLight; }
   Color _getSuhuStatusFg() { final v = double.tryParse(suhu); if (v == null) return AppColors.grayText; if (v >= 26 && v <= 30) return AppColors.greenText; return AppColors.amberText; }
-
   String _getPhStatus() { final v = double.tryParse(ph); if (v == null) return "-"; if (v >= 7 && v <= 8.5) return "Normal"; return v < 7 ? "Rendah" : "Tinggi"; }
   Color _getPhStatusBg() { final v = double.tryParse(ph); if (v == null) return AppColors.grayLight; if (v >= 7 && v <= 8.5) return AppColors.greenLight; return AppColors.amberLight; }
   Color _getPhStatusFg() { final v = double.tryParse(ph); if (v == null) return AppColors.grayText; if (v >= 7 && v <= 8.5) return AppColors.greenText; return AppColors.amberText; }
-
   String _getDoStatus() { final v = double.tryParse(dissolvedOxygen); if (v == null) return "-"; return v >= 5 ? "Normal" : "Rendah"; }
   Color _getDoStatusBg() { final v = double.tryParse(dissolvedOxygen); if (v == null) return AppColors.grayLight; return v >= 5 ? AppColors.greenLight : AppColors.amberLight; }
   Color _getDoStatusFg() { final v = double.tryParse(dissolvedOxygen); if (v == null) return AppColors.grayText; return v >= 5 ? AppColors.greenText : AppColors.amberText; }
 
-  Widget _sensorCard({
-    required String label, required String value, required String unit,
-    required IconData icon,
-    required Color bgColor, required Color borderColor, required Color accentColor,
-    required Color labelColor, required Color iconBg, required Color iconColor,
-    required Color valueColor, required Color unitColor,
-    required String statusText, required Color statusBg, required Color statusFg,
-  }) {
+  Widget _sensorCard({required String label, required String value, required String unit, required IconData icon, required Color bgColor, required Color borderColor, required Color accentColor, required Color labelColor, required Color iconBg, required Color iconColor, required Color valueColor, required Color unitColor, required String statusText, required Color statusBg, required Color statusFg}) {
     return Container(
-      decoration: BoxDecoration(
-        color: bgColor, borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: borderColor, width: 0.5),
-      ),
+      decoration: BoxDecoration(color: bgColor, borderRadius: BorderRadius.circular(16), border: Border.all(color: borderColor, width: 0.5)),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
         child: Column(
@@ -1043,27 +1108,21 @@ class _MQTTPageState extends State<MQTTPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(label, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: labelColor, letterSpacing: 0.5)),
-                      Container(width: 28, height: 28, decoration: BoxDecoration(color: iconBg, borderRadius: BorderRadius.circular(8)), child: Icon(icon, color: iconColor, size: 15)),
-                    ],
-                  ),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Text(label, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: labelColor, letterSpacing: 0.5)),
+                    Container(width: 28, height: 28, decoration: BoxDecoration(color: iconBg, borderRadius: BorderRadius.circular(8)), child: Icon(icon, color: iconColor, size: 15)),
+                  ]),
                   const SizedBox(height: 10),
                   Text(value, style: TextStyle(fontSize: 26, fontWeight: FontWeight.w600, color: valueColor, height: 1)),
                   const SizedBox(height: 6),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(unit, style: TextStyle(fontSize: 11, color: unitColor)),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                        decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(99)),
-                        child: Text(statusText, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w500, color: statusFg)),
-                      ),
-                    ],
-                  ),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Text(unit, style: TextStyle(fontSize: 11, color: unitColor)),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(99)),
+                      child: Text(statusText, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w500, color: statusFg)),
+                    ),
+                  ]),
                 ],
               ),
             ),
@@ -1078,12 +1137,11 @@ class _MQTTPageState extends State<MQTTPage> {
   // =====================================================
   Widget _buildChartCard() {
     final charts = {
-      'suhu': (spots: suhuHistory, color: AppColors.coralMid,  minY: 20.0, maxY: 40.0, unit: '°C',   label: 'Suhu', icon: Icons.thermostat_outlined, activeBg: AppColors.coralLight,  activeFg: AppColors.coralIconText),
-      'ph':   (spots: phHistory,   color: AppColors.purpleMid, minY:  0.0, maxY: 14.0, unit: 'pH',   label: 'pH',   icon: Icons.science_outlined,     activeBg: AppColors.purpleLight, activeFg: AppColors.purpleIconText),
-      'do':   (spots: doHistory,   color: AppColors.tealMid,   minY:  0.0, maxY: 10.0, unit: 'mg/L', label: 'DO',   icon: Icons.water_drop_outlined,  activeBg: AppColors.tealLight,   activeFg: AppColors.tealIconText),
+      'suhu': (spots: suhuHistory, color: AppColors.coralMid,  minY: 20.0, maxY: 40.0, label: 'Suhu', icon: Icons.thermostat_outlined, activeBg: AppColors.coralLight,  activeFg: AppColors.coralIconText),
+      'ph':   (spots: phHistory,   color: AppColors.purpleMid, minY:  0.0, maxY: 14.0, label: 'pH',   icon: Icons.science_outlined,     activeBg: AppColors.purpleLight, activeFg: AppColors.purpleIconText),
+      'do':   (spots: doHistory,   color: AppColors.tealMid,   minY:  0.0, maxY: 10.0, label: 'DO',   icon: Icons.water_drop_outlined,  activeBg: AppColors.tealLight,   activeFg: AppColors.tealIconText),
     };
     final cur = charts[_selectedChart]!;
-
     return Container(
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border, width: 0.5)),
       padding: const EdgeInsets.all(16),
@@ -1108,19 +1166,12 @@ class _MQTTPageState extends State<MQTTPage> {
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 200),
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: isActive ? c.activeBg : Colors.transparent,
-                      borderRadius: BorderRadius.circular(99),
-                      border: isActive ? Border.all(color: c.color.withOpacity(0.3), width: 0.5) : null,
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(c.icon, size: 13, color: isActive ? c.activeFg : Colors.grey.shade400),
-                        const SizedBox(width: 5),
-                        Text(c.label, style: TextStyle(fontSize: 12, fontWeight: isActive ? FontWeight.w600 : FontWeight.w400, color: isActive ? c.activeFg : Colors.grey.shade500)),
-                      ],
-                    ),
+                    decoration: BoxDecoration(color: isActive ? c.activeBg : Colors.transparent, borderRadius: BorderRadius.circular(99), border: isActive ? Border.all(color: c.color.withOpacity(0.3), width: 0.5) : null),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Icon(c.icon, size: 13, color: isActive ? c.activeFg : Colors.grey.shade400),
+                      const SizedBox(width: 5),
+                      Text(c.label, style: TextStyle(fontSize: 12, fontWeight: isActive ? FontWeight.w600 : FontWeight.w400, color: isActive ? c.activeFg : Colors.grey.shade500)),
+                    ]),
                   ),
                 );
               }).toList(),
@@ -1178,17 +1229,15 @@ class _MQTTPageState extends State<MQTTPage> {
         children: [
           _cardSectionTitle("Mode & status"),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Container(width: 30, height: 30, decoration: BoxDecoration(color: AppColors.purpleLight, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.auto_mode, size: 15, color: AppColors.purpleMid)),
-              const SizedBox(width: 8),
-              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Text("Mode operasi", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
-                Text(autoMode ? "Auto-kontrol" : "Kontrol manual", style: const TextStyle(fontSize: 11, color: AppColors.grayText)),
-              ])),
-              Switch(value: autoMode, onChanged: (v) => publishMode(v ? "AUTO" : "MANUAL"), activeColor: AppColors.tealMid, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
-            ],
-          ),
+          Row(children: [
+            Container(width: 30, height: 30, decoration: BoxDecoration(color: AppColors.purpleLight, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.auto_mode, size: 15, color: AppColors.purpleMid)),
+            const SizedBox(width: 8),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text("Mode operasi", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+              Text(autoMode ? "Auto-kontrol" : "Kontrol manual", style: const TextStyle(fontSize: 11, color: AppColors.grayText)),
+            ])),
+            Switch(value: autoMode, onChanged: (v) => publishMode(v ? "AUTO" : "MANUAL"), activeColor: AppColors.tealMid, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
+          ]),
           const SizedBox(height: 12),
           Container(
             decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(10)),
@@ -1204,6 +1253,26 @@ class _MQTTPageState extends State<MQTTPage> {
               if (_esp32Ip.isNotEmpty) ...[
                 const SizedBox(height: 6),
                 _infoRow("IP ESP32", _esp32Ip),
+              ],
+              // ── Countdown ringkas di mode card ──
+              if (_dosingState != DosingState.idle) ...[
+                const SizedBox(height: 8),
+                const Divider(height: 1, color: AppColors.border),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(children: [
+                      Icon(_countdownIcon, size: 13, color: _countdownColor),
+                      const SizedBox(width: 5),
+                      Text(_countdownLabel, style: TextStyle(fontSize: 11, color: _countdownColor, fontWeight: FontWeight.w500)),
+                    ]),
+                    Text(
+                      _formatCountdown(_countdownSeconds),
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _countdownColor),
+                    ),
+                  ],
+                ),
               ],
             ]),
           ),
@@ -1229,24 +1298,21 @@ class _MQTTPageState extends State<MQTTPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              _cardSectionTitle("Kontrol aktuator"),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
-                child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
-              ),
-            ],
-          ),
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            _cardSectionTitle("Kontrol aktuator"),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
+              child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
+            ),
+          ]),
           const SizedBox(height: 10),
-          _actuatorRow(label: "Aerator utama",   value: aeratorUtama,    isFixed: true, fixedLabel: "24 jam"),
-          _actuatorRow(label: "Aerator backup",  value: aeratorBackup,   onChanged: autoMode ? null : (v) => publishRelay('kolam1/control/aerator_backup', v)),
-          _actuatorRow(label: "Pengaduk dolomit",value: pengadukDolomit, onChanged: autoMode ? null : (v) => publishRelay('kolam1/control/pengaduk_dolomit', v)),
-          _actuatorRow(label: "Pompa dolomit",   value: pompaDolomit,    onChanged: autoMode ? null : (v) => publishRelay('kolam1/control/pompa_dolomit', v)),
-          _actuatorRow(label: "Solenoid masuk",  value: solenoidIn,      onChanged: autoMode ? null : (v) => publishRelay('kolam1/control/solenoid_in', v)),
-          _actuatorRow(label: "Solenoid keluar", value: solenoidOut, isLast: true, onChanged: autoMode ? null : (v) => publishRelay('kolam1/control/solenoid_out', v)),
+          _actuatorRow(label: "Aerator utama",    value: aeratorUtama,    isFixed: true, fixedLabel: "24 jam"),
+          _actuatorRow(label: "Aerator backup",   value: aeratorBackup,   onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/aerator_backup'), v)),
+          _actuatorRow(label: "Pengaduk dolomit", value: pengadukDolomit, onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/pengaduk_dolomit'), v)),
+          _actuatorRow(label: "Pompa dolomit",    value: pompaDolomit,    onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/pompa_dolomit'), v)),
+          _actuatorRow(label: "Solenoid masuk",   value: solenoidIn,      onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/solenoid_in'), v)),
+          _actuatorRow(label: "Solenoid keluar",  value: solenoidOut, isLast: true, onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/solenoid_out'), v)),
         ],
       ),
     );
@@ -1254,11 +1320,7 @@ class _MQTTPageState extends State<MQTTPage> {
 
   Widget _cardSectionTitle(String title) => Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600));
 
-  Widget _actuatorRow({
-    required String label, required bool value,
-    bool isFixed = false, String? fixedLabel, bool isLast = false,
-    ValueChanged<bool>? onChanged,
-  }) {
+  Widget _actuatorRow({required String label, required bool value, bool isFixed = false, String? fixedLabel, bool isLast = false, ValueChanged<bool>? onChanged}) {
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 7),
       decoration: BoxDecoration(border: isLast ? null : const Border(bottom: BorderSide(color: AppColors.border, width: 0.5))),
