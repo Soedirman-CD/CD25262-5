@@ -863,8 +863,8 @@ class _MQTTPageState extends State<MQTTPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text("IoT Kolam Ikan", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF1A1A1A))),
-              Text("${_cfg.kolamName}${_cfg.isOwner ? "" : " · Tamu"}", style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+              const Text("AquaMIND", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF1A1A1A)), maxLines: 1, overflow: TextOverflow.ellipsis),
+              Text("${_cfg.kolamName}${_cfg.isOwner ? "" : " · Tamu"}", style: TextStyle(fontSize: 12, color: Colors.grey.shade500), maxLines: 1, overflow: TextOverflow.ellipsis),
             ],
           ),
         ),
@@ -1233,10 +1233,18 @@ class _MQTTPageState extends State<MQTTPage> {
             Container(width: 30, height: 30, decoration: BoxDecoration(color: AppColors.purpleLight, borderRadius: BorderRadius.circular(8)), child: const Icon(Icons.auto_mode, size: 15, color: AppColors.purpleMid)),
             const SizedBox(width: 8),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text("Mode operasi", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
-              Text(autoMode ? "Auto-kontrol" : "Kontrol manual", style: const TextStyle(fontSize: 11, color: AppColors.grayText)),
+              const Text("Mode operasi", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500), maxLines: 1, overflow: TextOverflow.ellipsis),
+              Text(autoMode ? "Auto-kontrol" : "Kontrol manual", style: const TextStyle(fontSize: 11, color: AppColors.grayText), maxLines: 1, overflow: TextOverflow.ellipsis),
             ])),
-            Switch(value: autoMode, onChanged: (v) => publishMode(v ? "AUTO" : "MANUAL"), activeColor: AppColors.tealMid, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
+            Switch(
+              value: autoMode,
+              onChanged: (v) {
+                setState(() => autoMode = v);
+                publishMode(v ? "AUTO" : "MANUAL");
+              },
+              activeColor: AppColors.tealMid,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
           ]),
           const SizedBox(height: 12),
           Container(
@@ -1292,31 +1300,67 @@ class _MQTTPageState extends State<MQTTPage> {
   }
 
   Widget _buildActuatorCard() {
-    return Container(
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border, width: 0.5)),
-      padding: const EdgeInsets.all(14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-            _cardSectionTitle("Kontrol aktuator"),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
-              child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
+      return Container(
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border, width: 0.5)),
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              _cardSectionTitle("Kontrol aktuator"),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
+                child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
+              ),
+            ]),
+            const SizedBox(height: 10),
+            _actuatorRow(label: "Aerator utama", value: aeratorUtama, isFixed: true, fixedLabel: "24 jam"),
+            _actuatorRow(
+              label: "Aerator backup",
+              value: aeratorBackup,
+              onChanged: autoMode ? null : (v) {
+                setState(() => aeratorBackup = v);
+                publishRelay(_cfg.topic('control/aerator_backup'), v);
+              },
             ),
-          ]),
-          const SizedBox(height: 10),
-          _actuatorRow(label: "Aerator utama",    value: aeratorUtama,    isFixed: true, fixedLabel: "24 jam"),
-          _actuatorRow(label: "Aerator backup",   value: aeratorBackup,   onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/aerator_backup'), v)),
-          _actuatorRow(label: "Pengaduk dolomit", value: pengadukDolomit, onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/pengaduk_dolomit'), v)),
-          _actuatorRow(label: "Pompa dolomit",    value: pompaDolomit,    onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/pompa_dolomit'), v)),
-          _actuatorRow(label: "Solenoid masuk",   value: solenoidIn,      onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/solenoid_in'), v)),
-          _actuatorRow(label: "Solenoid keluar",  value: solenoidOut, isLast: true, onChanged: autoMode ? null : (v) => publishRelay(_cfg.topic('control/solenoid_out'), v)),
-        ],
-      ),
-    );
-  }
+            _actuatorRow(
+              label: "Pengaduk dolomit",
+              value: pengadukDolomit,
+              onChanged: autoMode ? null : (v) {
+                setState(() => pengadukDolomit = v);
+                publishRelay(_cfg.topic('control/pengaduk_dolomit'), v);
+              },
+            ),
+            _actuatorRow(
+              label: "Pompa dolomit",
+              value: pompaDolomit,
+              onChanged: autoMode ? null : (v) {
+                setState(() => pompaDolomit = v);
+                publishRelay(_cfg.topic('control/pompa_dolomit'), v);
+              },
+            ),
+            _actuatorRow(
+              label: "Solenoid masuk",
+              value: solenoidIn,
+              onChanged: autoMode ? null : (v) {
+                setState(() => solenoidIn = v);
+                publishRelay(_cfg.topic('control/solenoid_in'), v);
+              },
+            ),
+            _actuatorRow(
+              label: "Solenoid keluar",
+              value: solenoidOut,
+              isLast: true,
+              onChanged: autoMode ? null : (v) {
+                setState(() => solenoidOut = v);
+                publishRelay(_cfg.topic('control/solenoid_out'), v);
+              },
+            ),
+          ],
+        ),
+      );
+    }
 
   Widget _cardSectionTitle(String title) => Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600));
 
