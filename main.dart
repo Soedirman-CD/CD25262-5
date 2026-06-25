@@ -92,13 +92,10 @@ enum DosingState { idle, mixing, dosing, aeration }
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  // Set callback navigasi dari KolamListPage → MQTTPage
-  // (menghindari circular import antara main.dart dan auth_page.dart)
   onKolamTap = (context, config) {
     Navigator.push(context,
         MaterialPageRoute(builder: (_) => MQTTPage(config: config)));
   };
-
   runApp(const MyApp());
 }
 
@@ -142,19 +139,9 @@ class MQTTPage extends StatefulWidget {
 
 class _MQTTPageState extends State<MQTTPage> {
 
-  // =====================================================
-  // CONFIG KOLAM
-  // =====================================================
   KolamConfig get _cfg => widget.config;
 
-  // =====================================================
-  // FIREBASE
-  // =====================================================
   final FirebaseFirestore firestore = FirebaseFirestore.instance;
-
-  // =====================================================
-  // MQTT CLIENT
-  // =====================================================
   late final MqttClient client;
 
   // =====================================================
@@ -188,20 +175,29 @@ class _MQTTPageState extends State<MQTTPage> {
 
   // =====================================================
   // STATE — COUNTDOWN DOSING
-  // Durasi total (ms) sama dengan konstanta di ESP32
   // =====================================================
-  static const int _mixingTotal   = 60;    // detik
-  static const int _dosingTotal   = 20;    // detik
-  static const int _aerationTotal = 900;   // detik (15 menit)
+  static const int _mixingTotal   = 60;
+  static const int _dosingTotal   = 15;
+  static const int _aerationTotal = 120;
 
   DosingState _dosingState      = DosingState.idle;
-  int         _countdownSeconds = 0;   // sisa waktu dari ESP32
-  Timer?      _countdownTimer;         // timer lokal 1 detik
-
-  // Flag: apakah aerasi backup adalah bagian dari sequence dosing pH
-  // (MIXING → DOSING → AERATION). Jika true, countdown 15 menit tampil.
-  // Jika false (aerasi karena DO rendah), tidak ada countdown.
+  int         _countdownSeconds = 0;
+  Timer?      _countdownTimer;
   bool _dosingSequenceActive = false;
+
+  // =====================================================
+  // RACE CONDITION FIX — Ignore window setelah publish
+  // Mencegah status dari device lain menimpa state lokal
+  // selama 1.5 detik setelah tombol ditekan
+  // =====================================================
+  final Map<String, DateTime> _lastPublishTime = {};
+  static const int _ignoreWindowMs = 1500;
+
+  bool _shouldIgnoreStatus(String controlTopic) {
+    final last = _lastPublishTime[controlTopic];
+    if (last == null) return false;
+    return DateTime.now().difference(last).inMilliseconds < _ignoreWindowMs;
+  }
 
   // =====================================================
   // HISTORY DATA
@@ -232,21 +228,11 @@ class _MQTTPageState extends State<MQTTPage> {
 
   // =====================================================
   // UPDATE DOSING STATE & COUNTDOWN
-  //
-  // Sequence dosing pH (mode AUTO):
-  //   MIXING_DOLOMIT  → countdown 60 detik  (ungu)
-  //   INJEKSI_PH      → countdown 20 detik  (amber)
-  //   AERATOR_BACKUP_ON setelah injeksi
-  //                   → countdown 15 menit  (teal)
-  //
-  // AERATOR_BACKUP_ON karena DO rendah → TIDAK ada countdown
-  // Mode MANUAL → selalu idle, tidak ada countdown
   // =====================================================
   void _updateDosingState(String status) {
     DosingState newState;
     int totalSeconds;
 
-    // Mode manual -> paksa idle
     if (!autoMode) {
       _dosingSequenceActive = false;
       _stopCountdown();
@@ -255,39 +241,30 @@ class _MQTTPageState extends State<MQTTPage> {
 
     switch (status) {
       case "MIXING_DOLOMIT":
-        // Awal sequence dosing pH
         _dosingSequenceActive = true;
         newState     = DosingState.mixing;
         totalSeconds = _mixingTotal;
         break;
-
       case "INJEKSI_PH":
-        // Lanjutan sequence — pastikan flag aktif
         _dosingSequenceActive = true;
         newState     = DosingState.dosing;
         totalSeconds = _dosingTotal;
         break;
-
       case "AERATOR_BACKUP_ON":
         if (_dosingSequenceActive) {
-          // Aerasi backup sebagai bagian akhir sequence dosing → countdown 15 menit
           newState     = DosingState.aeration;
           totalSeconds = _aerationTotal;
         } else {
-          // Aerasi backup karena DO rendah → tidak ada countdown
           _stopCountdown();
           return;
         }
         break;
-
       default:
-        // Status lain (NORMAL, LOW_PH, HIGH_PH, dll) → reset sequence & countdown
         _dosingSequenceActive = false;
         newState     = DosingState.idle;
         totalSeconds = 0;
     }
 
-    // Jika state berubah, reset countdown & timer
     if (newState != _dosingState) {
       _dosingState      = newState;
       _countdownSeconds = totalSeconds;
@@ -300,10 +277,8 @@ class _MQTTPageState extends State<MQTTPage> {
             if (_countdownSeconds > 0) {
               _countdownSeconds--;
             } else {
-              // Countdown habis
               _countdownTimer?.cancel();
               if (_dosingState == DosingState.aeration) {
-                // Sequence selesai, reset flag
                 _dosingSequenceActive = false;
               }
               _dosingState      = DosingState.idle;
@@ -315,9 +290,6 @@ class _MQTTPageState extends State<MQTTPage> {
     }
   }
 
-  // =====================================================
-  // STOP COUNTDOWN — reset ke idle
-  // =====================================================
   void _stopCountdown() {
     _countdownTimer?.cancel();
     _dosingSequenceActive = false;
@@ -328,7 +300,6 @@ class _MQTTPageState extends State<MQTTPage> {
     });
   }
 
-  // Format countdown: mm:ss atau ss tergantung durasi
   String _formatCountdown(int seconds) {
     if (seconds >= 60) {
       final m = seconds ~/ 60;
@@ -338,7 +309,6 @@ class _MQTTPageState extends State<MQTTPage> {
     return '${seconds}s';
   }
 
-  // Warna & label countdown berdasarkan state
   Color get _countdownColor {
     switch (_dosingState) {
       case DosingState.mixing:   return AppColors.purpleMid;
@@ -420,10 +390,6 @@ class _MQTTPageState extends State<MQTTPage> {
   // CONNECT MQTT
   // =====================================================
   Future<void> connectMQTT() async {
-    // Init client dengan broker dari config akun.
-    // createMqttClient() otomatis pilih implementasi sesuai
-    // platform: MqttServerClient (native, TCP+TLS port 8883)
-    // atau MqttBrowserClient (web, WebSocket/TLS port 8884).
     client = createMqttClient(
       _cfg.mqttBroker,
       'flutter_${_cfg.kolamId.substring(0, 8)}',
@@ -453,23 +419,39 @@ class _MQTTPageState extends State<MQTTPage> {
       try {
         final data = jsonDecode(payload);
         setState(() {
-          if (topic == _cfg.topic('sensor/suhu'))             suhu = data['value'].toStringAsFixed(2);
-          if (topic == _cfg.topic('sensor/ph'))               ph   = data['value'].toStringAsFixed(2);
-          if (topic == _cfg.topic('sensor/do'))               dissolvedOxygen = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('sensor/suhu'))   suhu = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('sensor/ph'))     ph   = data['value'].toStringAsFixed(2);
+          if (topic == _cfg.topic('sensor/do'))     dissolvedOxygen = data['value'].toStringAsFixed(2);
+
           if (topic == _cfg.topic('status/mode')) {
             autoMode = data['mode'] == "AUTO";
-            // Jika beralih ke MANUAL, hentikan countdown
             if (!autoMode) _stopCountdown();
           }
-          if (topic == _cfg.topic('status/aerator_backup'))   aeratorBackup = data['state'];
-          if (topic == _cfg.topic('status/pengaduk_dolomit')) pengadukDolomit = data['state'];
-          if (topic == _cfg.topic('status/pompa_dolomit'))    pompaDolomit = data['state'];
-          if (topic == _cfg.topic('status/solenoid_in'))      solenoidIn = data['state'];
-          if (topic == _cfg.topic('status/solenoid_out'))     solenoidOut = data['state'];
+
+          // ── Ignore window: status dari device lain tidak menimpa
+          //    state lokal selama 1.5 detik setelah tombol ditekan ──
+          if (topic == _cfg.topic('status/aerator_backup') &&
+              !_shouldIgnoreStatus(_cfg.topic('control/aerator_backup')))
+            aeratorBackup = data['state'];
+
+          if (topic == _cfg.topic('status/pengaduk_dolomit') &&
+              !_shouldIgnoreStatus(_cfg.topic('control/pengaduk_dolomit')))
+            pengadukDolomit = data['state'];
+
+          if (topic == _cfg.topic('status/pompa_dolomit') &&
+              !_shouldIgnoreStatus(_cfg.topic('control/pompa_dolomit')))
+            pompaDolomit = data['state'];
+
+          if (topic == _cfg.topic('status/solenoid_in') &&
+              !_shouldIgnoreStatus(_cfg.topic('control/solenoid_in')))
+            solenoidIn = data['state'];
+
+          if (topic == _cfg.topic('status/solenoid_out') &&
+              !_shouldIgnoreStatus(_cfg.topic('control/solenoid_out')))
+            solenoidOut = data['state'];
 
           if (topic == _cfg.topic('status/system')) {
             systemStatus = data['status'];
-            // ── Update countdown berdasarkan status sistem ──
             _updateDosingState(systemStatus);
           }
 
@@ -511,16 +493,12 @@ class _MQTTPageState extends State<MQTTPage> {
   // LOGOUT
   // =====================================================
   Future<void> _logout() async {
-    // Konfirmasi logout
     final confirm = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Text("Keluar", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-        content: Text(
-          "Apakah Anda yakin ingin keluar dari akun Anda?",
-          style: const TextStyle(fontSize: 14),
-        ),
+        content: const Text("Apakah Anda yakin ingin keluar dari akun Anda?", style: TextStyle(fontSize: 14)),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -541,21 +519,25 @@ class _MQTTPageState extends State<MQTTPage> {
     );
 
     if (confirm != true) return;
-
-    // Putuskan MQTT
     try { client.disconnect(); } catch (_) {}
-
-    // Hapus sesi Firebase Auth
     await FirebaseAuth.instance.signOut();
+    if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
+  }
 
-    // MQTTPage ini berada di atas stack Navigator (di-push dari
-    // KolamListPage), sehingga StreamBuilder di AuthWrapper yang
-    // sudah rebuild ke AuthPage tidak akan terlihat selama route
-    // ini masih ada di atas. Pop semua route sampai balik ke root
-    // (AuthWrapper) agar AuthPage langsung terlihat.
-    if (mounted) {
-      Navigator.of(context).popUntil((route) => route.isFirst);
-    }
+  // =====================================================
+  // SNACKBAR HELPER
+  // =====================================================
+  void _showSnackBar(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message, style: const TextStyle(fontSize: 13)),
+        backgroundColor: isError ? AppColors.redMid : AppColors.tealMid,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   // =====================================================
@@ -718,18 +700,38 @@ class _MQTTPageState extends State<MQTTPage> {
   }
 
   // =====================================================
-  // PUBLISH
+  // PUBLISH — dengan cek koneksi + ignore window
   // =====================================================
   void publishRelay(String topic, bool state) {
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode({"state": state}));
-    client.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
+    if (client.connectionStatus?.state != MqttConnectionState.connected) {
+      _showSnackBar("Jangan SPAM Aku Pleaseee :(", isError: true);
+      return;
+    }
+    try {
+      final builder = MqttClientPayloadBuilder();
+      builder.addString(jsonEncode({"state": state}));
+      client.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
+      // Catat waktu publish untuk ignore window
+      _lastPublishTime[topic] = DateTime.now();
+    } catch (e) {
+      debugPrint("PUBLISH ERROR: $e");
+      _showSnackBar("Gagal mengirim perintah", isError: true);
+    }
   }
 
   void publishMode(String mode) {
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode({"mode": mode}));
-    client.publishMessage(_cfg.topic('system/mode'), MqttQos.atLeastOnce, builder.payload!);
+    if (client.connectionStatus?.state != MqttConnectionState.connected) {
+      _showSnackBar("Tidak terhubung ke broker MQTT", isError: true);
+      return;
+    }
+    try {
+      final builder = MqttClientPayloadBuilder();
+      builder.addString(jsonEncode({"mode": mode}));
+      client.publishMessage(_cfg.topic('system/mode'), MqttQos.atLeastOnce, builder.payload!);
+    } catch (e) {
+      debugPrint("PUBLISH ERROR: $e");
+      _showSnackBar("Gagal mengirim perintah", isError: true);
+    }
   }
 
   // =====================================================
@@ -759,16 +761,16 @@ class _MQTTPageState extends State<MQTTPage> {
 
   String get statusLabel {
     switch (systemStatus) {
-      case "NORMAL":          return "Semua parameter normal";
-      case "LOW_DO":          return "Oksigen terlarut rendah";
-      case "LOW_PH":          return "pH berada di bawah ambang batas";
-      case "HIGH_PH":         return "pH berada di atas ambang batas";
-      case "FAILSAFE":        return "Mode failsafe aktif";
-      case "MIXING_DOLOMIT":  return "Sedang mengaduk dolomit";
-      case "INJEKSI_PH":      return "Sedang injeksi pH";
+      case "NORMAL":            return "Semua parameter normal";
+      case "LOW_DO":            return "Oksigen terlarut rendah";
+      case "LOW_PH":            return "pH berada di bawah ambang batas";
+      case "HIGH_PH":           return "pH berada di atas ambang batas";
+      case "FAILSAFE":          return "Mode failsafe aktif";
+      case "MIXING_DOLOMIT":    return "Sedang mengaduk dolomit";
+      case "INJEKSI_PH":        return "Sedang injeksi pH";
       case "AERATOR_BACKUP_ON": return "Aerasi backup aktif";
-      case "DISCONNECT":      return "ESP32 tidak terhubung";
-      default:                return "-";
+      case "DISCONNECT":        return "ESP32 tidak terhubung";
+      default:                  return "-";
     }
   }
 
@@ -829,7 +831,6 @@ class _MQTTPageState extends State<MQTTPage> {
               const SizedBox(height: 16),
               _buildAlertBanner(),
               const SizedBox(height: 14),
-              // ── Countdown card — hanya tampil saat dosing aktif ──
               if (_dosingState != DosingState.idle) ...[
                 _buildCountdownCard(),
                 const SizedBox(height: 14),
@@ -868,7 +869,6 @@ class _MQTTPageState extends State<MQTTPage> {
             ],
           ),
         ),
-        // ── Tombol Logout ──
         IconButton(
           onPressed: _logout,
           icon: const Icon(Icons.logout_rounded, size: 20),
@@ -882,7 +882,6 @@ class _MQTTPageState extends State<MQTTPage> {
           ),
         ),
         const SizedBox(width: 8),
-        // ── Tombol QR (hanya untuk pemilik) ──
         if (_cfg.isOwner)
           IconButton(
             onPressed: () => Navigator.push(context,
@@ -897,7 +896,6 @@ class _MQTTPageState extends State<MQTTPage> {
             ),
           ),
         const SizedBox(width: 6),
-        // ── Tombol kembali ke daftar kolam ──
         IconButton(
           onPressed: () => Navigator.pop(context),
           icon: const Icon(Icons.grid_view_rounded, size: 20),
@@ -978,7 +976,7 @@ class _MQTTPageState extends State<MQTTPage> {
   }
 
   // =====================================================
-  // COUNTDOWN CARD — tampil saat mixing / dosing / aeration
+  // COUNTDOWN CARD
   // =====================================================
   Widget _buildCountdownCard() {
     final progress = _countdownTotal > 0
@@ -998,7 +996,6 @@ class _MQTTPageState extends State<MQTTPage> {
         children: [
           Row(
             children: [
-              // Ikon proses
               Container(
                 width: 36, height: 36,
                 decoration: BoxDecoration(color: _countdownColor.withOpacity(0.15), shape: BoxShape.circle),
@@ -1009,43 +1006,27 @@ class _MQTTPageState extends State<MQTTPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      _countdownLabel,
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _countdownColor),
-                    ),
-                    Text(
-                      "Proses otomatis sedang berjalan",
-                      style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7)),
-                    ),
+                    Text(_countdownLabel, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: _countdownColor)),
+                    Text("Proses otomatis sedang berjalan", style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7))),
                   ],
                 ),
               ),
-              // Tampilan countdown waktu besar
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  color: _countdownColor,
-                  borderRadius: BorderRadius.circular(10),
-                ),
+                decoration: BoxDecoration(color: _countdownColor, borderRadius: BorderRadius.circular(10)),
                 child: Text(
                   _formatCountdown(_countdownSeconds),
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.white,
-                    fontFeatures: [FontFeature.tabularFigures()],
-                  ),
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: Colors.white,
+                      fontFeatures: [FontFeature.tabularFigures()]),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 14),
-          // Progress bar
           ClipRRect(
             borderRadius: BorderRadius.circular(99),
             child: LinearProgressIndicator(
-              value: progress,
-              minHeight: 6,
+              value: progress, minHeight: 6,
               backgroundColor: _countdownColor.withOpacity(0.12),
               valueColor: AlwaysStoppedAnimation<Color>(_countdownColor),
             ),
@@ -1054,14 +1035,8 @@ class _MQTTPageState extends State<MQTTPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                "Sisa ${_formatCountdown(_countdownSeconds)}",
-                style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7)),
-              ),
-              Text(
-                "Total ${_formatCountdown(_countdownTotal)}",
-                style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.5)),
-              ),
+              Text("Sisa ${_formatCountdown(_countdownSeconds)}", style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.7))),
+              Text("Total ${_formatCountdown(_countdownTotal)}", style: TextStyle(fontSize: 11, color: _countdownColor.withOpacity(0.5))),
             ],
           ),
         ],
@@ -1262,7 +1237,6 @@ class _MQTTPageState extends State<MQTTPage> {
                 const SizedBox(height: 6),
                 _infoRow("IP ESP32", _esp32Ip),
               ],
-              // ── Countdown ringkas di mode card ──
               if (_dosingState != DosingState.idle) ...[
                 const SizedBox(height: 8),
                 const Divider(height: 1, color: AppColors.border),
@@ -1275,10 +1249,7 @@ class _MQTTPageState extends State<MQTTPage> {
                       const SizedBox(width: 5),
                       Text(_countdownLabel, style: TextStyle(fontSize: 11, color: _countdownColor, fontWeight: FontWeight.w500)),
                     ]),
-                    Text(
-                      _formatCountdown(_countdownSeconds),
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _countdownColor),
-                    ),
+                    Text(_formatCountdown(_countdownSeconds), style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _countdownColor)),
                   ],
                 ),
               ],
@@ -1300,67 +1271,67 @@ class _MQTTPageState extends State<MQTTPage> {
   }
 
   Widget _buildActuatorCard() {
-      return Container(
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border, width: 0.5)),
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              _cardSectionTitle("Kontrol aktuator"),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
-                child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
-              ),
-            ]),
-            const SizedBox(height: 10),
-            _actuatorRow(label: "Aerator utama", value: aeratorUtama, isFixed: true, fixedLabel: "24 jam"),
-            _actuatorRow(
-              label: "Aerator backup",
-              value: aeratorBackup,
-              onChanged: autoMode ? null : (v) {
-                setState(() => aeratorBackup = v);
-                publishRelay(_cfg.topic('control/aerator_backup'), v);
-              },
+    return Container(
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: AppColors.border, width: 0.5)),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            _cardSectionTitle("Kontrol aktuator"),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(color: autoMode ? AppColors.greenLight : AppColors.blueLight, borderRadius: BorderRadius.circular(99)),
+              child: Text(autoMode ? "Auto" : "Manual", style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: autoMode ? AppColors.greenText : AppColors.blueText)),
             ),
-            _actuatorRow(
-              label: "Pengaduk dolomit",
-              value: pengadukDolomit,
-              onChanged: autoMode ? null : (v) {
-                setState(() => pengadukDolomit = v);
-                publishRelay(_cfg.topic('control/pengaduk_dolomit'), v);
-              },
-            ),
-            _actuatorRow(
-              label: "Pompa dolomit",
-              value: pompaDolomit,
-              onChanged: autoMode ? null : (v) {
-                setState(() => pompaDolomit = v);
-                publishRelay(_cfg.topic('control/pompa_dolomit'), v);
-              },
-            ),
-            _actuatorRow(
-              label: "Solenoid masuk",
-              value: solenoidIn,
-              onChanged: autoMode ? null : (v) {
-                setState(() => solenoidIn = v);
-                publishRelay(_cfg.topic('control/solenoid_in'), v);
-              },
-            ),
-            _actuatorRow(
-              label: "Solenoid keluar",
-              value: solenoidOut,
-              isLast: true,
-              onChanged: autoMode ? null : (v) {
-                setState(() => solenoidOut = v);
-                publishRelay(_cfg.topic('control/solenoid_out'), v);
-              },
-            ),
-          ],
-        ),
-      );
-    }
+          ]),
+          const SizedBox(height: 10),
+          _actuatorRow(label: "Aerator utama", value: aeratorUtama, isFixed: true, fixedLabel: "24 jam"),
+          _actuatorRow(
+            label: "Aerator backup",
+            value: aeratorBackup,
+            onChanged: autoMode ? null : (v) {
+              setState(() => aeratorBackup = v);
+              publishRelay(_cfg.topic('control/aerator_backup'), v);
+            },
+          ),
+          _actuatorRow(
+            label: "Pengaduk dolomit",
+            value: pengadukDolomit,
+            onChanged: autoMode ? null : (v) {
+              setState(() => pengadukDolomit = v);
+              publishRelay(_cfg.topic('control/pengaduk_dolomit'), v);
+            },
+          ),
+          _actuatorRow(
+            label: "Pompa dolomit",
+            value: pompaDolomit,
+            onChanged: autoMode ? null : (v) {
+              setState(() => pompaDolomit = v);
+              publishRelay(_cfg.topic('control/pompa_dolomit'), v);
+            },
+          ),
+          _actuatorRow(
+            label: "Solenoid masuk",
+            value: solenoidIn,
+            onChanged: autoMode ? null : (v) {
+              setState(() => solenoidIn = v);
+              publishRelay(_cfg.topic('control/solenoid_in'), v);
+            },
+          ),
+          _actuatorRow(
+            label: "Solenoid keluar",
+            value: solenoidOut,
+            isLast: true,
+            onChanged: autoMode ? null : (v) {
+              setState(() => solenoidOut = v);
+              publishRelay(_cfg.topic('control/solenoid_out'), v);
+            },
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _cardSectionTitle(String title) => Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600));
 
